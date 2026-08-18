@@ -1,1 +1,2 @@
 pysoem==1.1.13
+matplotlib
