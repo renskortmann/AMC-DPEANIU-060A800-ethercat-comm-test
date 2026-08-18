@@ -6,6 +6,7 @@ import threading
 from collections import deque
 from pathlib import Path
 
+import numpy as np
 import pysoem
 import tkinter as tk
 from tkinter import ttk
@@ -13,7 +14,7 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 # ------------ CONFIGURATION ------------
-ADAPTER_NAME = r"\\Device\\NPF_{FEDAB1B5-C8AC-4C77-9EAB-A081EF22B39C}"
+ADAPTER_NAME = r"\Device\NPF_{FEDAB1B5-C8AC-4C77-9EAB-A081EF22B39C}"
 
 LOG_FILE = "current_and_position_log.dat"
 
@@ -27,6 +28,11 @@ WINDOW_MAX_S = 5.0
 WINDOW_DEFAULT_S = 2.0
 WINDOW_STEP_S = 0.1
 BUFFER_MAXLEN = 20000     # ~20s of samples at 1kHz -- comfortably above WINDOW_MAX_S
+
+FFT_FREQ_MIN = 50         # FFT max-frequency slider range (Hz)
+FFT_FREQ_MAX = 250
+FFT_FREQ_STEP = 10
+FFT_FREQ_DEFAULT = 250
 
 # Binary .dat log format: 8-byte magic header + fixed-size records
 LOG_MAGIC = b"PDOBIN01"
@@ -68,11 +74,21 @@ def connect_and_configure(adapter_name):
     # Go operational
     #
     master.state = pysoem.OP_STATE
+    master.send_processdata()
+    master.receive_processdata(2000)
     master.write_state()
 
-    master.state_check(pysoem.OP_STATE, 50000)
+    # OP state is only confirmed once the slave sees live process-data frames
+    reached_op_state = False
+    for _ in range(40):
+        master.send_processdata()
+        master.receive_processdata(2000)
+        master.state_check(pysoem.OP_STATE, 50000)
+        if master.state == pysoem.OP_STATE:
+            reached_op_state = True
+            break
 
-    if master.state != pysoem.OP_STATE:
+    if not reached_op_state:
         raise RuntimeError("Failed to reach OP state")
 
     print("EtherCAT operational.")
@@ -179,7 +195,7 @@ def acquisition_loop(master, slave, k_p_amps, buffer, buffer_lock, stop_event, c
         # PDO exchange
         #
         master.send_processdata()
-        master.receive_processdata(2000)
+        wkc = master.receive_processdata(2000)
 
         pdo = slave.input
 
@@ -221,6 +237,7 @@ def acquisition_loop(master, slave, k_p_amps, buffer, buffer_lock, stop_event, c
 
             print(
                 f"t={elapsed:8.3f}s  "
+                f"WKC={wkc}/{master.expected_wkc}  "
                 f"SW=0x{status_word:04X}  "
                 f"I={current_amps:+8.3f}A  "
                 f"Pos={position:+10d}  "
@@ -308,9 +325,11 @@ def convert_dat_to_csv(dat_path):
 
 
 class ScopeGUI:
-    """Tkinter window with two scrolling scope graphs (position & current)
-    sharing a single adjustable time-axis window length, plus binary (.dat)
-    logging controls (start/pause/resume/stop, filename entry, convert to CSV).
+    """Tkinter window with a 2x2 graph grid: scrolling position/current scope
+    traces on the left sharing an adjustable time-axis window length, and
+    their live FFTs on the right sharing an adjustable max-frequency axis,
+    plus binary (.dat) logging controls (start/pause/resume/stop, filename
+    entry, convert to CSV).
     """
 
     def __init__(self, root, buffer, buffer_lock, stop_event, command_queue, status_queue):
@@ -325,6 +344,7 @@ class ScopeGUI:
         self.last_closed_log_path = None
 
         self.window_seconds = tk.DoubleVar(value=WINDOW_DEFAULT_S)
+        self.fft_max_freq = tk.IntVar(value=FFT_FREQ_DEFAULT)
         self.filename_var = tk.StringVar(value=LOG_FILE)
         self.status_var = tk.StringVar(value="Not logging.")
 
@@ -334,9 +354,11 @@ class ScopeGUI:
         main_frame = ttk.Frame(root)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        self.figure = Figure(figsize=(8, 6), dpi=100)
-        self.ax_position = self.figure.add_subplot(2, 1, 1)
-        self.ax_current = self.figure.add_subplot(2, 1, 2, sharex=self.ax_position)
+        self.figure = Figure(figsize=(11, 6), dpi=100)
+        self.ax_position = self.figure.add_subplot(2, 2, 1)
+        self.ax_current = self.figure.add_subplot(2, 2, 3, sharex=self.ax_position)
+        self.ax_fft_position = self.figure.add_subplot(2, 2, 2)
+        self.ax_fft_current = self.figure.add_subplot(2, 2, 4, sharex=self.ax_fft_position)
 
         self.ax_position.set_ylabel("Position (counts)")
         self.ax_position.set_title("Position")
@@ -346,8 +368,18 @@ class ScopeGUI:
         self.ax_current.set_xlabel("Time (s)")
         self.ax_current.set_title("Current")
 
+        self.ax_fft_position.set_ylabel("Magnitude")
+        self.ax_fft_position.set_title("Position FFT")
+        self.ax_fft_position.tick_params(labelbottom=False)
+
+        self.ax_fft_current.set_ylabel("Magnitude")
+        self.ax_fft_current.set_xlabel("Frequency (Hz)")
+        self.ax_fft_current.set_title("Current FFT")
+
         self.line_position, = self.ax_position.plot([], [], color="tab:blue")
         self.line_current, = self.ax_current.plot([], [], color="tab:orange")
+        self.line_fft_position, = self.ax_fft_position.plot([], [], color="tab:green")
+        self.line_fft_current, = self.ax_fft_current.plot([], [], color="tab:red")
 
         self.figure.tight_layout()
 
@@ -370,6 +402,23 @@ class ScopeGUI:
             label="Time window (s)",
         )
         self.slider.pack(fill=tk.X, expand=True)
+
+        #
+        # FFT max-frequency slider (controls both FFT graphs' x-axis range)
+        #
+        fft_slider_frame = ttk.Frame(main_frame)
+        fft_slider_frame.pack(fill=tk.X, padx=8, pady=(0, 8))
+
+        self.fft_freq_slider = tk.Scale(
+            fft_slider_frame,
+            from_=FFT_FREQ_MIN,
+            to=FFT_FREQ_MAX,
+            resolution=FFT_FREQ_STEP,
+            orient=tk.HORIZONTAL,
+            variable=self.fft_max_freq,
+            label="Max Frequency (Hz)",
+        )
+        self.fft_freq_slider.pack(fill=tk.X, expand=True)
 
         #
         # Logging controls: filename entry + start/pause/resume, stop, convert
@@ -507,9 +556,39 @@ class ScopeGUI:
             self.ax_current.relim()
             self.ax_current.autoscale_view(scalex=False, scaley=True)
 
+            self._update_fft_plots(times, positions, currents)
+
             self.canvas.draw_idle()
 
         self.root.after(GUI_REFRESH_MS, self.refresh)
+
+    def _update_fft_plots(self, times, positions, currents):
+        if len(times) < 2:
+            return
+
+        # actual sample spacing (not nominal), to tolerate cycle-time jitter
+        dt = (times[-1] - times[0]) / (len(times) - 1)
+        if dt <= 0:
+            return
+
+        freqs = np.fft.rfftfreq(len(times), d=dt)
+        pos_mag = np.abs(np.fft.rfft(np.asarray(positions) - np.mean(positions)))
+        cur_mag = np.abs(np.fft.rfft(np.asarray(currents) - np.mean(currents)))
+
+        max_freq = self.fft_max_freq.get()
+        mask = freqs <= max_freq
+        if not mask.any():
+            return
+
+        self.line_fft_position.set_data(freqs[mask], pos_mag[mask])
+        self.line_fft_current.set_data(freqs[mask], cur_mag[mask])
+
+        self.ax_fft_position.set_xlim(0, max_freq)
+
+        self.ax_fft_position.relim()
+        self.ax_fft_position.autoscale_view(scalex=False, scaley=True)
+        self.ax_fft_current.relim()
+        self.ax_fft_current.autoscale_view(scalex=False, scaley=True)
 
     def on_close(self):
         self.stop_event.set()
