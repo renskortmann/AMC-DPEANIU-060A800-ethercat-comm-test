@@ -7,7 +7,12 @@ from collections import deque
 from pathlib import Path
 
 import numpy as np
-import pysoem
+try:
+    import pysoem
+    _PYSOEM_AVAILABLE = True
+except (ImportError, OSError):
+    pysoem = None
+    _PYSOEM_AVAILABLE = False
 import tkinter as tk
 from tkinter import ttk
 from matplotlib.figure import Figure
@@ -17,12 +22,14 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 ADAPTER_NAME = r"\Device\NPF_{FEDAB1B5-C8AC-4C77-9EAB-A081EF22B39C}"
 
 LOG_FILE = "current_and_position_log.dat"
+DATA_DIR  = Path("data")            # all .dat and .csv files are stored here
 
 CYCLE_TIME_S = 0.001      # 1 ms target cycle
 PRINT_INTERVAL_S = 1.0    # print once per second
 LOG_BATCH_SIZE = 100      # flush every 100 samples
 
 GUI_REFRESH_MS = 50       # ~20 Hz GUI redraw rate, decoupled from the 1kHz acquisition loop
+FULL_REDRAW_EVERY = 5     # full matplotlib redraw every N frames; blit on the rest (~4x faster)
 WINDOW_MIN_S = 0.1        # shared time-axis slider range (seconds)
 WINDOW_MAX_S = 5.0
 WINDOW_DEFAULT_S = 2.0
@@ -127,9 +134,10 @@ def acquisition_loop(master, slave, k_p_amps, buffer, buffer_lock, stop_event, c
                 return
 
             base_path = Path(command[1])
-            timestamp = time.strftime("%d-%m-%Y-%H-%M-%S")
+            timestamp = time.strftime("%d-%m-%Y_%H-%M-%S")
             suffix = base_path.suffix or ".dat"
-            new_path = base_path.with_name(f"{base_path.stem}_{timestamp}{suffix}")
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            new_path = DATA_DIR / f"{base_path.stem}_{timestamp}{suffix}"
 
             try:
                 new_file = open(new_path, "wb")
@@ -324,6 +332,122 @@ def convert_dat_to_csv(dat_path):
     return csv_path
 
 
+def simulation_acquisition_loop(buffer, buffer_lock, stop_event, command_queue, status_queue):
+    """Generates synthetic position and current data at ~1 kHz for use when
+    real EtherCAT hardware is unavailable.  Uses the same command_queue /
+    status_queue protocol as acquisition_loop so that binary file logging
+    works identically in simulation mode.
+    """
+
+    SIM_POS_AMP   = 50000  # peak position amplitude (counts)
+    SIM_POS_FREQ  = 0.5    # position oscillation (Hz)
+    SIM_CUR_AMP   = 2.5    # peak current amplitude (A)
+    SIM_CUR_FREQ  = 3.0    # current oscillation (Hz)
+    SIM_NOISE_AMP = 0.05   # current noise (A)
+
+    log_state = "IDLE"       # IDLE -> RUNNING <-> PAUSED -> (stop) -> IDLE
+    log_file = None
+    log_path = None
+    log_byte_buffer = bytearray()
+
+    def handle_command(command):
+        nonlocal log_state, log_file, log_path, log_byte_buffer
+
+        action = command[0]
+
+        if action == "start":
+            if log_state != "IDLE":
+                return
+
+            base_path = Path(command[1])
+            timestamp = time.strftime("%d-%m-%Y-%H-%M-%S")
+            suffix = base_path.suffix or ".dat"
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            new_path = DATA_DIR / f"{base_path.stem}_{timestamp}{suffix}"
+
+            try:
+                new_file = open(new_path, "wb")
+                new_file.write(LOG_MAGIC)
+            except OSError as exc:
+                status_queue.put(("error", str(exc)))
+                return
+
+            log_file = new_file
+            log_path = str(new_path)
+            log_byte_buffer = bytearray()
+            log_state = "RUNNING"
+            status_queue.put(("started", log_path))
+
+        elif action == "pause":
+            if log_state == "RUNNING":
+                log_state = "PAUSED"
+                status_queue.put(("paused", log_path))
+
+        elif action == "resume":
+            if log_state == "PAUSED":
+                log_state = "RUNNING"
+                status_queue.put(("resumed", log_path))
+
+        elif action == "stop":
+            if log_state in ("RUNNING", "PAUSED"):
+                if log_byte_buffer:
+                    log_file.write(bytes(log_byte_buffer))
+                    log_byte_buffer.clear()
+                log_file.close()
+                status_queue.put(("stopped", log_path))
+                log_state = "IDLE"
+                log_file = None
+
+    start_time = time.perf_counter()
+    next_cycle = start_time
+    last_loop_time = start_time
+    prev_position = 0
+
+    while not stop_event.is_set():
+
+        while True:
+            try:
+                command = command_queue.get_nowait()
+            except queue.Empty:
+                break
+            handle_command(command)
+
+        now = time.perf_counter()
+        actual_cycle_ms = (now - last_loop_time) * 1000.0
+        last_loop_time = now
+        elapsed = now - start_time
+
+        position = int(SIM_POS_AMP * np.sin(2 * np.pi * SIM_POS_FREQ * elapsed))
+        velocity = int((position - prev_position) / CYCLE_TIME_S)
+        prev_position = position
+        current_amps = (
+            SIM_CUR_AMP * np.sin(2 * np.pi * SIM_CUR_FREQ * elapsed)
+            + SIM_NOISE_AMP * (2.0 * np.random.random() - 1.0)
+        )
+
+        with buffer_lock:
+            buffer.append((elapsed, position, current_amps))
+
+        if log_state == "RUNNING":
+            log_byte_buffer += RECORD_STRUCT.pack(
+                elapsed, actual_cycle_ms, current_amps, position, velocity
+            )
+            if len(log_byte_buffer) >= LOG_BATCH_SIZE * RECORD_STRUCT.size:
+                log_file.write(bytes(log_byte_buffer))
+                log_byte_buffer.clear()
+
+        next_cycle += CYCLE_TIME_S
+        remaining = next_cycle - time.perf_counter()
+        if remaining > 0:
+            time.sleep(remaining)
+
+    if log_state in ("RUNNING", "PAUSED") and log_file is not None:
+        if log_byte_buffer:
+            log_file.write(bytes(log_byte_buffer))
+            log_byte_buffer.clear()
+        log_file.close()
+
+
 class ScopeGUI:
     """Tkinter window with a 2x2 graph grid: scrolling position/current scope
     traces on the left sharing an adjustable time-axis window length, and
@@ -332,7 +456,7 @@ class ScopeGUI:
     entry, convert to CSV).
     """
 
-    def __init__(self, root, buffer, buffer_lock, stop_event, command_queue, status_queue):
+    def __init__(self, root, buffer, buffer_lock, stop_event, command_queue, status_queue, sim_warning=None):
         self.root = root
         self.buffer = buffer
         self.buffer_lock = buffer_lock
@@ -348,7 +472,11 @@ class ScopeGUI:
         self.filename_var = tk.StringVar(value=LOG_FILE)
         self.status_var = tk.StringVar(value="Not logging.")
 
-        root.title("EtherCAT Drive Scope - Position & Current")
+        root.title(
+            "EtherCAT Drive Scope - Position & Current  [SIMULATION]"
+            if sim_warning else
+            "EtherCAT Drive Scope - Position & Current"
+        )
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         main_frame = ttk.Frame(root)
@@ -383,73 +511,110 @@ class ScopeGUI:
 
         self.figure.tight_layout()
 
-        self.canvas = FigureCanvasTkAgg(self.figure, master=main_frame)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        # Blitting: mark every data line as "animated" so it is excluded from
+        # the background snapshot. The background (axes frames, tick labels,
+        # grid) is only re-rendered every FULL_REDRAW_EVERY frames; all other
+        # frames restore the cached background and blit only the lines —
+        # typically 10-20× faster than a full draw.
+        for _line in (self.line_position, self.line_current,
+                      self.line_fft_position, self.line_fft_current):
+            _line.set_animated(True)
+
+        # Seed xlim so the axes look right before the first data arrives.
+        self.ax_position.set_xlim(-WINDOW_DEFAULT_S, 0.0)
+        self.ax_fft_position.set_xlim(0, FFT_FREQ_DEFAULT)
+
+        self._blit_bg = None          # cached background (captured after full draw)
+        self._blit_counter = 0        # counts refresh calls since last full draw
+        self._needs_full_draw = True  # forces a full draw on first refresh
+
+        # Simulation warning banner — spans full width at the very top.
+        if sim_warning:
+            tk.Label(
+                main_frame,
+                text=f"\u26a0  SIMULATION MODE \u2014 {sim_warning}",
+                background="#c0392b",
+                foreground="white",
+                font=("TkDefaultFont", 10, "bold"),
+                anchor="w",
+                padx=8,
+                pady=4,
+            ).pack(side=tk.TOP, fill=tk.X)
+
+        # Horizontal content area: controls column on the left, canvas on the right.
+        content_frame = ttk.Frame(main_frame)
+        content_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
         #
-        # Shared time-axis window slider (controls both graphs at once)
+        # Left controls column
         #
-        slider_frame = ttk.Frame(main_frame)
-        slider_frame.pack(fill=tk.X, padx=8, pady=(0, 8))
+        controls_panel = ttk.Frame(content_frame, padding=8)
+        controls_panel.pack(side=tk.LEFT, fill=tk.Y)
 
+        ttk.Separator(content_frame, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y)
+
+        # Time-axis window slider (vertical, top = max window)
+        ttk.Label(controls_panel, text="Time window (s)").pack(anchor="w")
         self.slider = tk.Scale(
-            slider_frame,
-            from_=WINDOW_MIN_S,
-            to=WINDOW_MAX_S,
+            controls_panel,
+            from_=WINDOW_MAX_S,
+            to=WINDOW_MIN_S,
             resolution=WINDOW_STEP_S,
-            orient=tk.HORIZONTAL,
+            orient=tk.VERTICAL,
             variable=self.window_seconds,
-            label="Time window (s)",
         )
-        self.slider.pack(fill=tk.X, expand=True)
+        self.slider.pack(fill=tk.Y, expand=True)
 
-        #
-        # FFT max-frequency slider (controls both FFT graphs' x-axis range)
-        #
-        fft_slider_frame = ttk.Frame(main_frame)
-        fft_slider_frame.pack(fill=tk.X, padx=8, pady=(0, 8))
+        ttk.Separator(controls_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
 
+        # FFT max-frequency slider (vertical, top = max frequency)
+        ttk.Label(controls_panel, text="Max Freq (Hz)").pack(anchor="w")
         self.fft_freq_slider = tk.Scale(
-            fft_slider_frame,
-            from_=FFT_FREQ_MIN,
-            to=FFT_FREQ_MAX,
+            controls_panel,
+            from_=FFT_FREQ_MAX,
+            to=FFT_FREQ_MIN,
             resolution=FFT_FREQ_STEP,
-            orient=tk.HORIZONTAL,
+            orient=tk.VERTICAL,
             variable=self.fft_max_freq,
-            label="Max Frequency (Hz)",
         )
-        self.fft_freq_slider.pack(fill=tk.X, expand=True)
+        self.fft_freq_slider.pack(fill=tk.Y, expand=True)
 
-        #
-        # Logging controls: filename entry + start/pause/resume, stop, convert
-        #
-        log_frame = ttk.Frame(main_frame)
-        log_frame.pack(fill=tk.X, padx=8, pady=(0, 8))
-        log_frame.columnconfigure(1, weight=1)
+        ttk.Separator(controls_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
 
-        ttk.Label(log_frame, text="Log filename:").grid(row=0, column=0, sticky="w")
-
-        self.filename_entry = ttk.Entry(log_frame, textvariable=self.filename_var)
-        self.filename_entry.grid(row=0, column=1, columnspan=3, sticky="we", padx=(6, 0))
+        # Logging controls
+        ttk.Label(controls_panel, text="Log filename:").pack(anchor="w")
+        self.filename_entry = ttk.Entry(controls_panel, textvariable=self.filename_var)
+        self.filename_entry.pack(fill=tk.X, pady=(2, 0))
 
         self.log_toggle_button = ttk.Button(
-            log_frame, text="Start Log", command=self.on_log_toggle_click
+            controls_panel, text="Start Log", command=self.on_log_toggle_click
         )
-        self.log_toggle_button.grid(row=1, column=1, sticky="we", pady=(6, 0))
+        self.log_toggle_button.pack(fill=tk.X, pady=(6, 0))
 
         self.stop_log_button = ttk.Button(
-            log_frame, text="Stop Log", command=self.on_stop_log_click, state=tk.DISABLED
+            controls_panel, text="Stop Log", command=self.on_stop_log_click, state=tk.DISABLED
         )
-        self.stop_log_button.grid(row=1, column=2, sticky="we", pady=(6, 0), padx=(6, 0))
+        self.stop_log_button.pack(fill=tk.X, pady=(4, 0))
 
         self.convert_button = ttk.Button(
-            log_frame, text="Convert to CSV", command=self.on_convert_click, state=tk.DISABLED
+            controls_panel, text="Convert to CSV", command=self.on_convert_click, state=tk.DISABLED
         )
-        self.convert_button.grid(row=1, column=3, sticky="we", pady=(6, 0), padx=(6, 0))
+        self.convert_button.pack(fill=tk.X, pady=(4, 0))
 
-        ttk.Label(log_frame, textvariable=self.status_var).grid(
-            row=2, column=0, columnspan=4, sticky="w", pady=(6, 0)
-        )
+        ttk.Label(
+            controls_panel, textvariable=self.status_var, wraplength=150, justify=tk.LEFT
+        ).pack(fill=tk.X, pady=(8, 0))
+
+        #
+        # Canvas — fills the remaining space to the right of the controls column
+        #
+        self.canvas = FigureCanvasTkAgg(self.figure, master=content_frame)
+        self.canvas.get_tk_widget().pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Invalidate the blit background whenever the axes parameters change.
+        self.canvas.mpl_connect("resize_event", self._invalidate_blit_bg)
+        self.window_seconds.trace_add("write", self._invalidate_blit_bg)
+        self.fft_max_freq.trace_add("write", self._invalidate_blit_bg)
 
         self.root.after(GUI_REFRESH_MS, self.refresh)
 
@@ -526,6 +691,13 @@ class ScopeGUI:
                 self.convert_button.config(state=tk.NORMAL)
                 self.status_var.set(f"Conversion failed: {payload}")
 
+    def _invalidate_blit_bg(self, *_):
+        """Force a full matplotlib redraw on the next refresh cycle.
+        Called on canvas resize and when the time-window or FFT-frequency
+        slider changes so the axes decorations are redrawn with new limits.
+        """
+        self._needs_full_draw = True
+
     def refresh(self):
         if self.stop_event.is_set():
             return
@@ -542,23 +714,39 @@ class ScopeGUI:
 
             visible = [s for s in snapshot if s[0] >= cutoff]
 
-            times = [s[0] for s in visible]
+            times     = [s[0] for s in visible]
             positions = [s[1] for s in visible]
-            currents = [s[2] for s in visible]
+            currents  = [s[2] for s in visible]
 
-            self.line_position.set_data(times, positions)
-            self.line_current.set_data(times, currents)
+            # Express x as "seconds before now" so xlim stays fixed at
+            # [-window, 0] — a stable coordinate space that allows blitting
+            # without the axes drifting between full redraws.
+            rel_times = [t - now for t in times]
 
-            self.ax_position.set_xlim(cutoff, now)
+            self.line_position.set_data(rel_times, positions)
+            self.line_current.set_data(rel_times, currents)
 
-            self.ax_position.relim()
-            self.ax_position.autoscale_view(scalex=False, scaley=True)
-            self.ax_current.relim()
-            self.ax_current.autoscale_view(scalex=False, scaley=True)
+            self._blit_counter += 1
+            full_draw = self._needs_full_draw or (self._blit_counter % FULL_REDRAW_EVERY == 0)
 
-            self._update_fft_plots(times, positions, currents)
-
-            self.canvas.draw_idle()
+            if full_draw:
+                self._needs_full_draw = False
+                self.ax_position.set_xlim(-window, 0.0)
+                self.ax_position.relim()
+                self.ax_position.autoscale_view(scalex=False, scaley=True)
+                self.ax_current.relim()
+                self.ax_current.autoscale_view(scalex=False, scaley=True)
+                self._update_fft_plots(times, positions, currents)
+                self.canvas.draw()
+                self._blit_bg = self.canvas.copy_from_bbox(self.figure.bbox)
+            else:
+                # Fast path: restore cached background and blit only the lines.
+                self.canvas.restore_region(self._blit_bg)
+                self.ax_position.draw_artist(self.line_position)
+                self.ax_current.draw_artist(self.line_current)
+                self.ax_fft_position.draw_artist(self.line_fft_position)
+                self.ax_fft_current.draw_artist(self.line_fft_current)
+                self.canvas.blit(self.figure.bbox)
 
         self.root.after(GUI_REFRESH_MS, self.refresh)
 
@@ -597,7 +785,20 @@ class ScopeGUI:
 
 def main():
 
-    master, slave, k_p_amps = connect_and_configure(ADAPTER_NAME)
+    master = None
+    slave = None
+    k_p_amps = None
+    sim_warning = None
+
+    if not _PYSOEM_AVAILABLE:
+        sim_warning = "pysoem not available (missing DLL). Showing simulated data."
+        print(f"WARNING: {sim_warning}")
+    else:
+        try:
+            master, slave, k_p_amps = connect_and_configure(ADAPTER_NAME)
+        except Exception as exc:
+            sim_warning = f"Hardware unavailable ({exc}). Showing simulated data."
+            print(f"WARNING: {sim_warning}")
 
     buffer = deque(maxlen=BUFFER_MAXLEN)
     buffer_lock = threading.Lock()
@@ -605,15 +806,22 @@ def main():
     command_queue = queue.Queue()
     status_queue = queue.Queue()
 
-    acq_thread = threading.Thread(
-        target=acquisition_loop,
-        args=(master, slave, k_p_amps, buffer, buffer_lock, stop_event, command_queue, status_queue),
-        daemon=True,
-    )
+    if sim_warning:
+        acq_thread = threading.Thread(
+            target=simulation_acquisition_loop,
+            args=(buffer, buffer_lock, stop_event, command_queue, status_queue),
+            daemon=True,
+        )
+    else:
+        acq_thread = threading.Thread(
+            target=acquisition_loop,
+            args=(master, slave, k_p_amps, buffer, buffer_lock, stop_event, command_queue, status_queue),
+            daemon=True,
+        )
     acq_thread.start()
 
     root = tk.Tk()
-    ScopeGUI(root, buffer, buffer_lock, stop_event, command_queue, status_queue)
+    ScopeGUI(root, buffer, buffer_lock, stop_event, command_queue, status_queue, sim_warning=sim_warning)
 
     try:
         root.mainloop()
@@ -625,7 +833,8 @@ def main():
     stop_event.set()
     acq_thread.join(timeout=5.0)
 
-    master.close()
+    if master is not None:
+        master.close()
 
 
 if __name__ == "__main__":
