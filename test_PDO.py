@@ -41,6 +41,27 @@ FFT_FREQ_MAX = 250
 FFT_FREQ_STEP = 10
 FFT_FREQ_DEFAULT = 250
 
+# CiA402 Controlword (0x6040) commands and masked Statusword (0x6041) states.
+# Assumes Controlword/Statusword sit at RxPDO/TxPDO byte offset 0 (AMC default).
+CIA402_CW_FAULT_RESET = 0x0080
+CIA402_CW_DISABLE_VOLTAGE = 0x0000
+CIA402_CW_SHUTDOWN = 0x0006
+CIA402_CW_SWITCH_ON = 0x0007
+CIA402_CW_ENABLE_OPERATION = 0x000F
+
+CIA402_SW_MASK = 0x006F
+CIA402_SW_FAULT_BIT = 0x0008
+CIA402_SW_READY_TO_SWITCH_ON = 0x0021
+CIA402_SW_SWITCHED_ON = 0x0023
+CIA402_SW_OPERATION_ENABLED = 0x0027
+
+CIA402_MODE_CST = 10  # Cyclic Synchronous Torque -- required for 0x6071 Target Torque to be used
+
+ENABLE_STEP_TIMEOUT_S = 1.0  # give up on a single state-machine step after this long
+
+SINE_FREQ_HZ = 10.0     # current-loop reference applied once the drive is enabled
+SINE_AMPLITUDE_A = 2.0
+
 # Binary .dat log format: 8-byte magic header + fixed-size records
 LOG_MAGIC = b"PDOBIN01"
 RECORD_STRUCT = struct.Struct("<dffii")  # elapsed_s, cycle_ms, current_A, position_counts, velocity_counts_per_sec
@@ -103,6 +124,117 @@ def connect_and_configure(adapter_name):
     return master, slave, k_p_amps
 
 
+def _write_output(slave, controlword, target_current_raw=0):
+    # AMC default RxPDO layout (assumed, mirrors the TxPDO read layout):
+    # Controlword at offset 0, target current at offset 10.
+    # slave.output returns an immutable bytes copy -- rebuild and reassign it.
+    buf = bytearray(slave.output)
+    struct.pack_into("<H", buf, 0, controlword)
+    struct.pack_into("<h", buf, 10, target_current_raw)
+    slave.output = bytes(buf)
+
+
+def _amps_to_raw_current(amps, k_p_amps):
+    raw = int(round(amps * 8192.0 / k_p_amps))
+    return max(-32768, min(32767, raw))
+
+
+def _read_fault_info(slave):
+    """Best-effort read of the standard CoE error register/history (0x1001 /
+    0x1003) -- not every object is guaranteed to exist on a given slave."""
+    parts = []
+    try:
+        error_register = struct.unpack("<B", slave.sdo_read(0x1001, 0x00))[0]
+        parts.append(f"0x1001 Error Register=0x{error_register:02X}")
+    except Exception as exc:
+        parts.append(f"0x1001 read failed ({exc})")
+
+    try:
+        num_errors = struct.unpack("<B", slave.sdo_read(0x1003, 0x00))[0]
+        if num_errors:
+            last_error = struct.unpack("<I", slave.sdo_read(0x1003, 0x01))[0]
+            parts.append(f"0x1003 Last Error=0x{last_error:08X}")
+    except Exception as exc:
+        parts.append(f"0x1003 read failed ({exc})")
+
+    return ", ".join(parts) if parts else "no fault info available"
+
+
+def _exchange_and_read_statusword(master, slave):
+    master.send_processdata()
+    wkc = master.receive_processdata(2000)
+    status_word = struct.unpack_from("<H", slave.input, 0)[0]
+    return status_word, wkc
+
+
+def run_enable_sequence(master, slave):
+    """Fault-reset (if needed) and step the CiA402 state machine up to
+    Operation Enabled via RxPDO Controlword writes. Raises RuntimeError if
+    any step doesn't complete within ENABLE_STEP_TIMEOUT_S.
+    """
+
+    def wait_for_masked_state(target_masked, controlword):
+        _write_output(slave, controlword)
+        deadline = time.perf_counter() + ENABLE_STEP_TIMEOUT_S
+        status_word, wkc = 0, 0
+        while time.perf_counter() < deadline:
+            status_word, wkc = _exchange_and_read_statusword(master, slave)
+            if (status_word & CIA402_SW_MASK) == target_masked:
+                return status_word
+            time.sleep(CYCLE_TIME_S)
+        raise RuntimeError(
+            f"Drive did not reach statusword 0x{target_masked:02X} after "
+            f"writing controlword 0x{controlword:04X} (last SW=0x{status_word:04X}, "
+            f"WKC={wkc}/{master.expected_wkc})"
+        )
+
+    status_word, wkc = _exchange_and_read_statusword(master, slave)
+
+    if status_word & CIA402_SW_FAULT_BIT:
+        error_info = _read_fault_info(slave)
+        print(
+            f"Drive is faulted (SW=0x{status_word:04X}, WKC={wkc}/{master.expected_wkc}, "
+            f"{error_info}); attempting reset..."
+        )
+
+        _write_output(slave, CIA402_CW_FAULT_RESET)
+        deadline = time.perf_counter() + ENABLE_STEP_TIMEOUT_S
+        while status_word & CIA402_SW_FAULT_BIT:
+            if time.perf_counter() >= deadline:
+                raise RuntimeError(
+                    f"Fault reset failed (last SW=0x{status_word:04X}, "
+                    f"WKC={wkc}/{master.expected_wkc}, {error_info})"
+                )
+            status_word, wkc = _exchange_and_read_statusword(master, slave)
+            time.sleep(CYCLE_TIME_S)
+        _write_output(slave, CIA402_CW_DISABLE_VOLTAGE)
+        _exchange_and_read_statusword(master, slave)
+
+    wait_for_masked_state(CIA402_SW_READY_TO_SWITCH_ON, CIA402_CW_SHUTDOWN)
+    wait_for_masked_state(CIA402_SW_SWITCHED_ON, CIA402_CW_SWITCH_ON)
+
+    # Target Torque (0x6071) is only used by the drive in Cyclic Synchronous
+    # Torque mode -- switch to it via SDO before enabling operation.
+    slave.sdo_write(0x6060, 0x00, struct.pack("<b", CIA402_MODE_CST))
+    actual_mode = struct.unpack("<b", slave.sdo_read(0x6061, 0x00))[0]
+    if actual_mode != CIA402_MODE_CST:
+        raise RuntimeError(
+            f"Drive rejected Cyclic Synchronous Torque mode (0x6061 reads {actual_mode})"
+        )
+
+    status_word = wait_for_masked_state(CIA402_SW_OPERATION_ENABLED, CIA402_CW_ENABLE_OPERATION)
+
+    return status_word
+
+
+def disable_drive(master, slave):
+    """Best-effort Shutdown command to bring the drive out of Operation
+    Enabled (e.g. before closing the master)."""
+    _write_output(slave, CIA402_CW_SHUTDOWN)
+    status_word, _wkc = _exchange_and_read_statusword(master, slave)
+    return status_word
+
+
 def acquisition_loop(master, slave, k_p_amps, buffer, buffer_lock, stop_event, command_queue, status_queue):
     """Cyclic PDO read loop, meant to run in a background thread.
 
@@ -123,13 +255,33 @@ def acquisition_loop(master, slave, k_p_amps, buffer, buffer_lock, stop_event, c
     log_file = None
     log_path = None
     log_byte_buffer = bytearray()
+    drive_enabled = False
+    sine_start_time = None   # perf_counter() timestamp when the drive was enabled
 
     def handle_command(command):
-        nonlocal log_state, log_file, log_path, log_byte_buffer
+        nonlocal log_state, log_file, log_path, log_byte_buffer, drive_enabled, sine_start_time
 
         action = command[0]
 
-        if action == "start":
+        if action == "enable":
+            try:
+                status_word = run_enable_sequence(master, slave)
+                drive_enabled = True
+                sine_start_time = time.perf_counter()
+                status_queue.put(("drive_enabled", status_word))
+            except RuntimeError as exc:
+                print(f"Drive enable failed: {exc}")
+                status_queue.put(("drive_enable_error", str(exc)))
+            return
+
+        elif action == "disable":
+            status_word = disable_drive(master, slave)
+            drive_enabled = False
+            sine_start_time = None
+            status_queue.put(("drive_disabled", status_word))
+            return
+
+        elif action == "start":
             if log_state != "IDLE":
                 return
 
@@ -198,6 +350,14 @@ def acquisition_loop(master, slave, k_p_amps, buffer, buffer_lock, stop_event, c
         now = time.perf_counter()
         actual_cycle_ms = (now - last_loop_time) * 1000.0
         last_loop_time = now
+
+        #
+        # Drive the current-loop sine wave reference while enabled
+        #
+        if drive_enabled and sine_start_time is not None:
+            target_amps = SINE_AMPLITUDE_A * np.sin(2 * np.pi * SINE_FREQ_HZ * (now - sine_start_time))
+            target_raw = _amps_to_raw_current(target_amps, k_p_amps)
+            _write_output(slave, CIA402_CW_ENABLE_OPERATION, target_raw)
 
         #
         # PDO exchange
@@ -282,6 +442,13 @@ def acquisition_loop(master, slave, k_p_amps, buffer, buffer_lock, stop_event, c
             log_byte_buffer.clear()
         log_file.close()
 
+    # Best-effort: don't leave the drive Operation Enabled after the script exits.
+    if drive_enabled:
+        try:
+            disable_drive(master, slave)
+        except OSError:
+            pass
+
 
 def convert_dat_to_csv(dat_path):
     """Convert a completed binary .dat log file to a .csv file with the same
@@ -355,7 +522,15 @@ def simulation_acquisition_loop(buffer, buffer_lock, stop_event, command_queue, 
 
         action = command[0]
 
-        if action == "start":
+        if action == "enable":
+            status_queue.put(("drive_enabled", CIA402_SW_OPERATION_ENABLED))
+            return
+
+        elif action == "disable":
+            status_queue.put(("drive_disabled", 0x0000))
+            return
+
+        elif action == "start":
             if log_state != "IDLE":
                 return
 
@@ -471,6 +646,7 @@ class ScopeGUI:
         self.fft_max_freq = tk.IntVar(value=FFT_FREQ_DEFAULT)
         self.filename_var = tk.StringVar(value=LOG_FILE)
         self.status_var = tk.StringVar(value="Not logging.")
+        self.drive_status_var = tk.StringVar(value="Drive: unknown")
 
         root.title(
             "EtherCAT Drive Scope - Position & Current  [SIMULATION]"
@@ -581,6 +757,23 @@ class ScopeGUI:
 
         ttk.Separator(controls_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
 
+        # Drive enable/disable controls (CiA402 Controlword state machine)
+        self.enable_button = ttk.Button(
+            controls_panel, text="Enable Drive", command=self.on_enable_click
+        )
+        self.enable_button.pack(fill=tk.X)
+
+        self.disable_button = ttk.Button(
+            controls_panel, text="Disable Drive", command=self.on_disable_click, state=tk.DISABLED
+        )
+        self.disable_button.pack(fill=tk.X, pady=(4, 0))
+
+        ttk.Label(
+            controls_panel, textvariable=self.drive_status_var, wraplength=150, justify=tk.LEFT
+        ).pack(fill=tk.X, pady=(4, 0))
+
+        ttk.Separator(controls_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
+
         # Logging controls
         ttk.Label(controls_panel, text="Log filename:").pack(anchor="w")
         self.filename_entry = ttk.Entry(controls_panel, textvariable=self.filename_var)
@@ -618,6 +811,15 @@ class ScopeGUI:
 
         self.root.after(GUI_REFRESH_MS, self.refresh)
 
+    def on_enable_click(self):
+        self.enable_button.config(state=tk.DISABLED)
+        self.drive_status_var.set("Drive: enabling...")
+        self.command_queue.put(("enable",))
+
+    def on_disable_click(self):
+        self.disable_button.config(state=tk.DISABLED)
+        self.command_queue.put(("disable",))
+
     def on_log_toggle_click(self):
         if self.log_state == "IDLE":
             self.command_queue.put(("start", self.filename_var.get()))
@@ -654,7 +856,19 @@ class ScopeGUI:
             except queue.Empty:
                 break
 
-            if event == "started":
+            if event == "drive_enabled":
+                self.disable_button.config(state=tk.NORMAL)
+                self.drive_status_var.set(f"Drive: enabled (SW=0x{payload:04X})")
+
+            elif event == "drive_enable_error":
+                self.enable_button.config(state=tk.NORMAL)
+                self.drive_status_var.set(f"Drive enable failed: {payload}")
+
+            elif event == "drive_disabled":
+                self.enable_button.config(state=tk.NORMAL)
+                self.drive_status_var.set(f"Drive: disabled (SW=0x{payload:04X})")
+
+            elif event == "started":
                 self.log_state = "RUNNING"
                 self.log_toggle_button.config(text="Pause Log")
                 self.stop_log_button.config(state=tk.NORMAL)
