@@ -55,6 +55,10 @@ CIA402_SW_READY_TO_SWITCH_ON = 0x0021
 CIA402_SW_SWITCHED_ON = 0x0023
 CIA402_SW_OPERATION_ENABLED = 0x0027
 
+CIA402_MODES_OF_OPERATION_INDEX = 0x6060
+CIA402_MODES_OF_OPERATION_SUB_INDEX = 0x00
+CIA402_MODES_OF_OPERATION_DISPLAY_INDEX = 0x6061
+CIA402_MODES_OF_OPERATION_DISPLAY_SUB_INDEX = 0x00
 CIA402_MODE_CST = 10  # Cyclic Synchronous Torque -- required for 0x6071 Target Torque to be used
 
 ENABLE_STEP_TIMEOUT_S = 1.0  # give up on a single state-machine step after this long
@@ -135,9 +139,8 @@ def _write_output(slave, controlword, target_current_raw=0):
 
 
 def _amps_to_raw_current(amps, k_p_amps):
-    raw = int(round(amps * 8192.0 / k_p_amps))
+    raw = int(round(amps * 32768.0 / k_p_amps))  # DC2 = 2^15 / K_P
     return max(-32768, min(32767, raw))
-
 
 def _read_fault_info(slave):
     """Best-effort read of the standard CoE error register/history (0x1001 /
@@ -213,10 +216,10 @@ def run_enable_sequence(master, slave):
     wait_for_masked_state(CIA402_SW_READY_TO_SWITCH_ON, CIA402_CW_SHUTDOWN)
     wait_for_masked_state(CIA402_SW_SWITCHED_ON, CIA402_CW_SWITCH_ON)
 
-    # Target Torque (0x6071) is only used by the drive in Cyclic Synchronous
+    # Current Torque (0x6071) will be used by the drive in Cyclic Synchronous
     # Torque mode -- switch to it via SDO before enabling operation.
-    slave.sdo_write(0x6060, 0x00, struct.pack("<b", CIA402_MODE_CST))
-    actual_mode = struct.unpack("<b", slave.sdo_read(0x6061, 0x00))[0]
+    slave.sdo_write(CIA402_MODES_OF_OPERATION_INDEX, CIA402_MODES_OF_OPERATION_SUB_INDEX, struct.pack("<b", CIA402_MODE_CST))
+    actual_mode = struct.unpack("<b", slave.sdo_read(CIA402_MODES_OF_OPERATION_DISPLAY_INDEX, CIA402_MODES_OF_OPERATION_DISPLAY_SUB_INDEX))[0]
     if actual_mode != CIA402_MODE_CST:
         raise RuntimeError(
             f"Drive rejected Cyclic Synchronous Torque mode (0x6061 reads {actual_mode})"
