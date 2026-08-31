@@ -732,31 +732,31 @@ class ScopeGUI:
 
         ttk.Separator(content_frame, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y)
 
-        # Time-axis window slider (vertical, top = max window)
+        # Time-axis window slider (horizontal, right = max window)
         ttk.Label(controls_panel, text="Time window (s)").pack(anchor="w")
         self.slider = tk.Scale(
             controls_panel,
-            from_=WINDOW_MAX_S,
-            to=WINDOW_MIN_S,
+            from_=WINDOW_MIN_S,
+            to=WINDOW_MAX_S,
             resolution=WINDOW_STEP_S,
-            orient=tk.VERTICAL,
+            orient=tk.HORIZONTAL,
             variable=self.window_seconds,
         )
-        self.slider.pack(fill=tk.Y, expand=True)
+        self.slider.pack(fill=tk.X, expand=True)
 
         ttk.Separator(controls_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
 
-        # FFT max-frequency slider (vertical, top = max frequency)
+        # FFT max-frequency slider (horizontal, right = max frequency)
         ttk.Label(controls_panel, text="Max Freq (Hz)").pack(anchor="w")
         self.fft_freq_slider = tk.Scale(
             controls_panel,
-            from_=FFT_FREQ_MAX,
-            to=FFT_FREQ_MIN,
+            from_=FFT_FREQ_MIN,
+            to=FFT_FREQ_MAX,
             resolution=FFT_FREQ_STEP,
-            orient=tk.VERTICAL,
+            orient=tk.HORIZONTAL,
             variable=self.fft_max_freq,
         )
-        self.fft_freq_slider.pack(fill=tk.Y, expand=True)
+        self.fft_freq_slider.pack(fill=tk.X, expand=True)
 
         ttk.Separator(controls_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
 
