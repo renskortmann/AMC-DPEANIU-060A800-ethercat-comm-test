@@ -73,10 +73,52 @@ ANALOG_INPUT_2_TPDO_OFFSET = 14
 SINE_FREQ_HZ = 10.0     # current-loop reference applied once the drive is enabled
 SINE_AMPLITUDE_A = 2.0
 
+# --------- PDO MAPPING CONFIGURATION ---------
+# Explicit RxPDO (0x1600) and TxPDO (0x1A00) mapping definitions.
+# Each entry is (obj_index, obj_subindex, bit_length).
+# This ensures the script is self-sufficient and doesn't depend on the drive's stored mapping.
+RXPDO_MAPPING = [
+    (0x6040, 0x00, 16),   # Control Word
+    (0x607A, 0x00, 32),   # Target Position
+    (0x60FF, 0x00, 32),   # Target Velocity
+    (0x6071, 0x00, 16),   # Target Current
+    (0x2001, 0x03, 16),   # User Bits
+]
+
+TXPDO_MAPPING = [
+    (0x6041, 0x00, 16),   # Status Word
+    (0x6064, 0x00, 32),   # Actual Position
+    (0x606C, 0x00, 32),   # Actual Velocity
+    (0x6077, 0x00, 16),   # Actual Current
+    (0x2023, 0x01, 16),   # Digital Inputs
+    (0x201A, 0x02, 16),   # Analog Input 2 Value (laser sensor cross-check)
+]
+
 # Binary .dat log format: 8-byte magic header + fixed-size records
 LOG_MAGIC = b"PDOBIN01"
 RECORD_STRUCT = struct.Struct("<dfffii")  # elapsed_s, cycle_ms, current_A, analog_input_2_raw, position_counts, velocity_counts_per_sec
 # ---------------------------------------
+
+
+def _configure_pdo_mapping(slave, mapping_index, entries):
+    """Configure RPDO (0x1600) or TPDO (0x1A00) mapping via SDO.
+    
+    Must be called while the EtherCAT state machine is in Pre-Operational state.
+    Writes mapping entries (obj_index, obj_subindex, bit_length) to the specified
+    mapping object index.
+    """
+    # Disable mapping while editing per manual section "PDO Configuration"
+    slave.sdo_write(mapping_index, 0x00, struct.pack("<B", 0))
+    
+    # Write each entry as a packed 32-bit value: (index << 16) | (subindex << 8) | bitlength
+    for i, (obj_index, obj_sub, bit_length) in enumerate(entries, start=1):
+        if i > 16:
+            raise ValueError(f"Cannot map more than 16 entries to mapping index 0x{mapping_index:04X}")
+        mapping_value = (obj_index << 16) | (obj_sub << 8) | bit_length
+        slave.sdo_write(mapping_index, i, struct.pack("<I", mapping_value))
+    
+    # Re-enable with final count
+    slave.sdo_write(mapping_index, 0x00, struct.pack("<B", len(entries)))
 
 
 def connect_and_configure(adapter_name):
@@ -105,25 +147,38 @@ def connect_and_configure(adapter_name):
     print(f"Maximum Peak Current = {k_p_amps:.1f} A")
 
     #
-    # Configure PDO mapping from slave defaults
+    # Configure PDO mappings explicitly to ensure Analog Input 2 is included.
+    # Must be done while slave is in Pre-Operational state (guaranteed after config_init).
+    #
+    _configure_pdo_mapping(slave, 0x1600, RXPDO_MAPPING)
+    _configure_pdo_mapping(slave, 0x1A00, TXPDO_MAPPING)
+    print(f"Configured RxPDO ({len(RXPDO_MAPPING)} entries) and TxPDO ({len(TXPDO_MAPPING)} entries)")
+
+    #
+    # Apply PDO mapping to the master
     #
     master.config_map()
 
     #
-    # Verify active TxPDO mapping (Task 5: Configuration persistence verification)
-    # Read back the actual TxPDO configuration to confirm Analog Input 2 is mapped
-    # at the expected offset and that DriveWare's stored mapping was used.
+    # Verify active TxPDO mapping (must now match TXPDO_MAPPING after explicit configuration).
     #
-    try:
-        tpdo_count = struct.unpack("<B", slave.sdo_read(0x1A00, 0x00))[0]
-        mapped_entries = [
-            struct.unpack("<I", slave.sdo_read(0x1A00, sub))[0]
-            for sub in range(1, tpdo_count + 1)
-        ]
-        print(f"Active TxPDO mapping ({tpdo_count} entries): "
-              + ", ".join(f"0x{e:08X}" for e in mapped_entries))
-    except Exception as exc:
-        print(f"Warning: Could not verify TxPDO mapping via SDO: {exc}")
+    tpdo_count = struct.unpack("<B", slave.sdo_read(0x1A00, 0x00))[0]
+    mapped_entries = [
+        struct.unpack("<I", slave.sdo_read(0x1A00, sub))[0]
+        for sub in range(1, tpdo_count + 1)
+    ]
+    
+    # Verify Analog Input 2 (0x201A:02) is mapped
+    expected_ai2_mapping = (0x201A << 16) | (0x02 << 8) | 16
+    if tpdo_count != len(TXPDO_MAPPING) or expected_ai2_mapping not in mapped_entries:
+        raise RuntimeError(
+            f"TxPDO mapping verification failed: expected {len(TXPDO_MAPPING)} entries "
+            f"with AI2 (0x{expected_ai2_mapping:08X}), got {tpdo_count} entries: "
+            + ", ".join(f"0x{e:08X}" for e in mapped_entries)
+        )
+    
+    print(f"Active TxPDO mapping ({tpdo_count} entries): "
+          + ", ".join(f"0x{e:08X}" for e in mapped_entries))
 
     #
     # Go operational
@@ -184,6 +239,59 @@ def _read_fault_info(slave):
         parts.append(f"0x1003 read failed ({exc})")
 
     return ", ".join(parts) if parts else "no fault info available"
+
+
+def _read_extended_fault_info(slave):
+    """Read and decode 0x1001 (Error Register) and 0x2002h (Drive/System Status) bits."""
+    parts = []
+    
+    # Error Register 0x1001:0x00 — bit meanings per CANopen standard
+    try:
+        error_reg = struct.unpack("<B", slave.sdo_read(0x1001, 0x00))[0]
+        error_bits = []
+        if error_reg & 0x01:
+            error_bits.append("Generic Error")
+        if error_reg & 0x02:
+            error_bits.append("Over-Current")
+        if error_reg & 0x04:
+            error_bits.append("Over-Voltage")
+        if error_reg & 0x08:
+            error_bits.append("Thermal")
+        if error_reg & 0x10:
+            error_bits.append("Device-Specific-1")
+        if error_reg & 0x20:
+            error_bits.append("Device-Specific-2")
+        if error_reg & 0x40:
+            error_bits.append("Communication")
+        if error_reg & 0x80:
+            error_bits.append("Protocol")
+        parts.append(f"0x1001={error_bits if error_bits else ['None']}")
+    except Exception as exc:
+        parts.append(f"0x1001 read failed: {exc}")
+    
+    # Drive/System Status 0x2002h — read all 7 sub-indices
+    for sub in range(1, 8):
+        try:
+            status_val = struct.unpack("<H", slave.sdo_read(0x2002, sub))[0]
+            if status_val:
+                parts.append(f"0x2002.{sub:02X}=0x{status_val:04X}")
+        except Exception:
+            pass  # Sub-index may not exist
+    
+    return " | ".join(parts) if parts else "no extended diagnostics available"
+
+
+def _check_and_log_fault_during_operation(master, slave, log_prefix=""):
+    """Check if fault bit is set in TxPDO status word; if so, read extended diagnostics."""
+    try:
+        status_word = struct.unpack_from("<H", slave.input, 0)[0]
+        if status_word & CIA402_SW_FAULT_BIT:
+            extended_info = _read_extended_fault_info(slave)
+            print(f"[FAULT DETECTED] {log_prefix} SW=0x{status_word:04X} | {extended_info}")
+            return extended_info
+    except Exception as exc:
+        print(f"[ERROR checking fault] {exc}")
+    return None
 
 
 def _exchange_and_read_statusword(master, slave):
@@ -407,6 +515,15 @@ def acquisition_loop(master, slave, k_p_amps, buffer, buffer_lock, stop_event, c
         current_amps = raw_current * k_p_amps / 8192.0
 
         elapsed = now - start_time
+        
+        #
+        # Monitor for secondary faults during operation (every 10 samples = ~10ms at 1kHz)
+        #
+        if drive_enabled and (sample_count % 10 == 0):
+            fault_info = _check_and_log_fault_during_operation(master, slave, log_prefix=f"t={elapsed:.3f}s")
+            if fault_info is not None:
+                drive_enabled = False
+                status_queue.put(("drive_fault_secondary", fault_info))
 
         with buffer_lock:
             buffer.append((elapsed, position, current_amps, analog_input_2_raw))
@@ -938,6 +1055,11 @@ class ScopeGUI:
             elif event == "convert_error":
                 self.convert_button.config(state=tk.NORMAL)
                 self.status_var.set(f"Conversion failed: {payload}")
+            
+            elif event == "drive_fault_secondary":
+                self.enable_button.config(state=tk.NORMAL)
+                self.drive_status_var.set(f"Drive: FAULTED during operation")
+                self.status_var.set(f"Secondary Fault Diagnostics: {payload}")
 
     def _invalidate_blit_bg(self, *_):
         """Force a full matplotlib redraw on the next refresh cycle.
@@ -981,11 +1103,11 @@ class ScopeGUI:
             else:
                 ai2_status = "AI2: --"
             
-            # Create a composite status including drive status and analog input
-            current_drive_status = self.drive_status_var.get()
-            if "Drive:" in current_drive_status:
-                # Extract just the drive status part and append AI2
-                self.drive_status_var.set(f"{current_drive_status}  {ai2_status}")
+            # # Create a composite status including drive status and analog input
+            # current_drive_status = self.drive_status_var.get()
+            # if "Drive:" in current_drive_status:
+            #     # Extract just the drive status part and append AI2
+            #     self.drive_status_var.set(f"{current_drive_status}  {ai2_status}")
 
             self._blit_counter += 1
             full_draw = self._needs_full_draw or (self._blit_counter % FULL_REDRAW_EVERY == 0)
