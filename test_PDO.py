@@ -63,12 +63,19 @@ CIA402_MODE_CST = 10  # Cyclic Synchronous Torque -- required for 0x6071 Target 
 
 ENABLE_STEP_TIMEOUT_S = 1.0  # give up on a single state-machine step after this long
 
+# --------- ANALOG INPUT 2 READOUT (PAI-2 CROSS-CHECK) ---------
+# PAI-2 (AUX Encoder, pin C4) is configured as Analog Input 2 on the drive.
+# Its scaled value (0x201A.02h) is PDO-mappable and appended to the default
+# TxPDO at byte offset 14 (after Digital Inputs, which end at byte 13).
+# Raw value is 16-bit signed, representing ±10V from the laser sensor.
+ANALOG_INPUT_2_TPDO_OFFSET = 14
+
 SINE_FREQ_HZ = 10.0     # current-loop reference applied once the drive is enabled
 SINE_AMPLITUDE_A = 2.0
 
 # Binary .dat log format: 8-byte magic header + fixed-size records
 LOG_MAGIC = b"PDOBIN01"
-RECORD_STRUCT = struct.Struct("<dffii")  # elapsed_s, cycle_ms, current_A, position_counts, velocity_counts_per_sec
+RECORD_STRUCT = struct.Struct("<dfffii")  # elapsed_s, cycle_ms, current_A, analog_input_2_raw, position_counts, velocity_counts_per_sec
 # ---------------------------------------
 
 
@@ -101,6 +108,22 @@ def connect_and_configure(adapter_name):
     # Configure PDO mapping from slave defaults
     #
     master.config_map()
+
+    #
+    # Verify active TxPDO mapping (Task 5: Configuration persistence verification)
+    # Read back the actual TxPDO configuration to confirm Analog Input 2 is mapped
+    # at the expected offset and that DriveWare's stored mapping was used.
+    #
+    try:
+        tpdo_count = struct.unpack("<B", slave.sdo_read(0x1A00, 0x00))[0]
+        mapped_entries = [
+            struct.unpack("<I", slave.sdo_read(0x1A00, sub))[0]
+            for sub in range(1, tpdo_count + 1)
+        ]
+        print(f"Active TxPDO mapping ({tpdo_count} entries): "
+              + ", ".join(f"0x{e:08X}" for e in mapped_entries))
+    except Exception as exc:
+        print(f"Warning: Could not verify TxPDO mapping via SDO: {exc}")
 
     #
     # Go operational
@@ -377,20 +400,23 @@ def acquisition_loop(master, slave, k_p_amps, buffer, buffer_lock, stop_event, c
         position = struct.unpack_from("<i", pdo, 2)[0]
         velocity = struct.unpack_from("<i", pdo, 6)[0]
         raw_current = struct.unpack_from("<h", pdo, 10)[0]
+        # Analog Input 2 (PAI-2 laser sensor) appended at byte offset 14
+        # (after Digital Inputs which end at byte 13 per Table B.2)
+        analog_input_2_raw = struct.unpack_from("<h", pdo, ANALOG_INPUT_2_TPDO_OFFSET)[0]
 
         current_amps = raw_current * k_p_amps / 8192.0
 
         elapsed = now - start_time
 
         with buffer_lock:
-            buffer.append((elapsed, position, current_amps))
+            buffer.append((elapsed, position, current_amps, analog_input_2_raw))
 
         #
         # Binary log write (only while logging is running)
         #
         if log_state == "RUNNING":
             log_byte_buffer += RECORD_STRUCT.pack(
-                elapsed, actual_cycle_ms, current_amps, position, velocity
+                elapsed, actual_cycle_ms, current_amps, analog_input_2_raw, position, velocity
             )
 
             if len(log_byte_buffer) >= LOG_BATCH_SIZE * RECORD_STRUCT.size:
@@ -411,6 +437,7 @@ def acquisition_loop(master, slave, k_p_amps, buffer, buffer_lock, stop_event, c
                 f"WKC={wkc}/{master.expected_wkc}  "
                 f"SW=0x{status_word:04X}  "
                 f"I={current_amps:+8.3f}A  "
+                f"AI2={analog_input_2_raw:+6d}  "
                 f"Pos={position:+10d}  "
                 f"Vel={velocity:+10d}  "
                 f"dt={actual_cycle_ms:6.3f}ms  "
@@ -476,6 +503,7 @@ def convert_dat_to_csv(dat_path):
                 "elapsed_s",
                 "cycle_ms",
                 "current_A",
+                "analog_input_2_raw",
                 "position_counts",
                 "velocity_counts_per_sec"
             ])
@@ -489,12 +517,13 @@ def convert_dat_to_csv(dat_path):
                 if len(chunk) != RECORD_STRUCT.size:
                     raise ValueError(f"'{dat_path}' contains a truncated record")
 
-                elapsed, cycle_ms, current_amps, position, velocity = RECORD_STRUCT.unpack(chunk)
+                elapsed, cycle_ms, current_amps, analog_input_2_raw, position, velocity = RECORD_STRUCT.unpack(chunk)
 
                 writer.writerow([
                     f"{elapsed:.6f}",
                     f"{cycle_ms:.3f}",
                     f"{current_amps:.5f}",
+                    analog_input_2_raw,
                     position,
                     velocity
                 ])
@@ -602,13 +631,15 @@ def simulation_acquisition_loop(buffer, buffer_lock, stop_event, command_queue, 
             SIM_CUR_AMP * np.sin(2 * np.pi * SIM_CUR_FREQ * elapsed)
             + SIM_NOISE_AMP * (2.0 * np.random.random() - 1.0)
         )
+        # Simulate analog input 2 as a scaled, noisy version of position for testing
+        analog_input_2_raw = int(position * 0.1 + SIM_NOISE_AMP * 100 * (2.0 * np.random.random() - 1.0))
 
         with buffer_lock:
-            buffer.append((elapsed, position, current_amps))
+            buffer.append((elapsed, position, current_amps, analog_input_2_raw))
 
         if log_state == "RUNNING":
             log_byte_buffer += RECORD_STRUCT.pack(
-                elapsed, actual_cycle_ms, current_amps, position, velocity
+                elapsed, actual_cycle_ms, current_amps, analog_input_2_raw, position, velocity
             )
             if len(log_byte_buffer) >= LOG_BATCH_SIZE * RECORD_STRUCT.size:
                 log_file.write(bytes(log_byte_buffer))
@@ -931,9 +962,10 @@ class ScopeGUI:
 
             visible = [s for s in snapshot if s[0] >= cutoff]
 
-            times     = [s[0] for s in visible]
-            positions = [s[1] for s in visible]
-            currents  = [s[2] for s in visible]
+            times              = [s[0] for s in visible]
+            positions          = [s[1] for s in visible]
+            currents           = [s[2] for s in visible]
+            analog_inputs_2    = [s[3] for s in visible]
 
             # Express x as "seconds before now" so xlim stays fixed at
             # [-window, 0] — a stable coordinate space that allows blitting
@@ -942,6 +974,18 @@ class ScopeGUI:
 
             self.line_position.set_data(rel_times, positions)
             self.line_current.set_data(rel_times, currents)
+
+            # Update live analog input 2 display (latest value in the status label)
+            if analog_inputs_2:
+                ai2_status = f"AI2: {analog_inputs_2[-1]:+6d}"
+            else:
+                ai2_status = "AI2: --"
+            
+            # Create a composite status including drive status and analog input
+            current_drive_status = self.drive_status_var.get()
+            if "Drive:" in current_drive_status:
+                # Extract just the drive status part and append AI2
+                self.drive_status_var.set(f"{current_drive_status}  {ai2_status}")
 
             self._blit_counter += 1
             full_draw = self._needs_full_draw or (self._blit_counter % FULL_REDRAW_EVERY == 0)
