@@ -24,17 +24,17 @@ ADAPTER_NAME = r"\Device\NPF_{FEDAB1B5-C8AC-4C77-9EAB-A081EF22B39C}"
 LOG_FILE = "current_and_position_log.dat"
 DATA_DIR  = Path("data")            # all .dat and .csv files are stored here
 
-CYCLE_TIME_S = 0.001      # 1 ms target cycle
-PRINT_INTERVAL_S = 1.0    # print once per second
-LOG_BATCH_SIZE = 100      # flush every 100 samples
+CYCLE_TIME_S = 0.010      # 10 ms target cycle (100 Hz PDO rate)
+PRINT_INTERVAL_S = 1.0    # print once per second (~100 samples at 100Hz)
+LOG_BATCH_SIZE = 50       # flush every 50 samples (now ~500ms at 100Hz, was ~500ms at 1kHz)
 
-GUI_REFRESH_MS = 50       # ~20 Hz GUI redraw rate, decoupled from the 1kHz acquisition loop
+GUI_REFRESH_MS = 100      # ~10 Hz GUI redraw rate, decoupled from 100Hz acquisition loop
 FULL_REDRAW_EVERY = 5     # full matplotlib redraw every N frames; blit on the rest (~4x faster)
 WINDOW_MIN_S = 0.1        # shared time-axis slider range (seconds)
 WINDOW_MAX_S = 5.0
 WINDOW_DEFAULT_S = 2.0
 WINDOW_STEP_S = 0.1
-BUFFER_MAXLEN = 20000     # ~20s of samples at 1kHz -- comfortably above WINDOW_MAX_S
+BUFFER_MAXLEN = 2000      # ~20s of samples at 100Hz PDO rate (was 20000 at 1kHz)
 
 FFT_FREQ_MIN = 50         # FFT max-frequency slider range (Hz)
 FFT_FREQ_MAX = 250
@@ -70,8 +70,11 @@ ENABLE_STEP_TIMEOUT_S = 1.0  # give up on a single state-machine step after this
 # Raw value is 16-bit signed, representing ±10V from the laser sensor.
 ANALOG_INPUT_2_TPDO_OFFSET = 14
 
-SINE_FREQ_HZ = 10.0     # current-loop reference applied once the drive is enabled
-SINE_AMPLITUDE_A = 2.0
+SINE_FREQ_HZ = 2.0      # current-loop reference applied once the drive is enabled (reduced from 10Hz for better sampling at 100Hz rate: 50 samples/period)
+SINE_AMPLITUDE_A = 1.0  # reduced from 2.0A to avoid exceeding velocity/acceleration protection limits at lower cycle rate
+
+# GUI PERFORMANCE TUNING
+ENABLE_FFT = False  # Set to False to reduce GIL contention during testing; True for full scope features
 
 # --------- PDO MAPPING CONFIGURATION ---------
 # Explicit RxPDO (0x1600) and TxPDO (0x1A00) mapping definitions.
@@ -145,6 +148,11 @@ def connect_and_configure(adapter_name):
     k_p_amps = raw_max_peak / 10.0
 
     print(f"Maximum Peak Current = {k_p_amps:.1f} A")
+
+    #
+    # Print protection limits before enabling
+    #
+    _print_protection_limits(slave)
 
     #
     # Configure PDO mappings explicitly to ensure Analog Input 2 is included.
@@ -294,9 +302,237 @@ def _check_and_log_fault_during_operation(master, slave, log_prefix=""):
     return None
 
 
+def _print_protection_limits(slave):
+    """Read and print drive protection limits at startup.
+    
+    Reads velocity and position limit objects (0x2037h, 0x2039h) and prints
+    them in a formatted block with both raw and converted values.
+    Each field is wrapped in try/except so one read failure doesn't block others.
+    """
+    print()
+    print("--- Drive Protection Limits (read at startup) ---")
+    
+    # Read KS (switching frequency) for velocity conversion
+    ks_hz = None
+    try:
+        ks_data = slave.sdo_read(0x20D8, 0x24)
+        # Handle both Unsigned16 (2 bytes) and Unsigned32 (4 bytes) formats
+        if len(ks_data) == 4:
+            ks_raw = struct.unpack("<I", ks_data)[0]
+        elif len(ks_data) == 2:
+            ks_raw = struct.unpack("<H", ks_data)[0]
+        else:
+            raise ValueError(f"Unexpected KS data length: {len(ks_data)} bytes (expected 2 or 4)")
+        ks_hz = ks_raw / 65536.0
+    except Exception as exc:
+        print(f"  WARNING: KS read failed ({exc}) — velocity limits unavailable")
+    
+    # Motor Over Speed Limit (0x2037.01h)
+    try:
+        motor_overspeed = struct.unpack("<i", slave.sdo_read(0x2037, 0x01))[0]
+        if ks_hz is not None:
+            converted = motor_overspeed * ks_hz / 131072.0  # DS1 to counts/s
+            print(f"  Motor Over Speed Limit:      {converted:+11.1f} counts/s   (raw DS1=0x{motor_overspeed:08X})")
+        else:
+            print(f"  Motor Over Speed Limit:      0x{motor_overspeed:08X} (raw DS1 — KS unavailable for conversion)")
+    except Exception as exc:
+        print(f"  Motor Over Speed Limit:      read failed ({exc})")
+    
+    # Positive Velocity Limit (0x2037.05h)
+    try:
+        pos_vel_limit = struct.unpack("<i", slave.sdo_read(0x2037, 0x05))[0]
+        if ks_hz is not None:
+            converted = pos_vel_limit * ks_hz / 131072.0
+            print(f"  Positive Velocity Limit:     {converted:+11.1f} counts/s   (raw DS1=0x{pos_vel_limit:08X})")
+        else:
+            print(f"  Positive Velocity Limit:     0x{pos_vel_limit:08X} (raw DS1 — KS unavailable for conversion)")
+    except Exception as exc:
+        print(f"  Positive Velocity Limit:     read failed ({exc})")
+    
+    # Negative Velocity Limit (0x2037.06h)
+    try:
+        neg_vel_limit = struct.unpack("<i", slave.sdo_read(0x2037, 0x06))[0]
+        if ks_hz is not None:
+            converted = neg_vel_limit * ks_hz / 131072.0
+            print(f"  Negative Velocity Limit:     {converted:+11.1f} counts/s   (raw DS1=0x{neg_vel_limit:08X})")
+        else:
+            print(f"  Negative Velocity Limit:     0x{neg_vel_limit:08X} (raw DS1 — KS unavailable for conversion)")
+    except Exception as exc:
+        print(f"  Negative Velocity Limit:     read failed ({exc})")
+    
+    if ks_hz is not None:
+        print(f"  (velocity conversion assumes KI=1; only valid if 1Vp-p Sin/Cos feedback is not in use)")
+    
+    # Position Limits Control (0x2039.0Ah) — already in counts
+    try:
+        pos_limits_control = struct.unpack("<H", slave.sdo_read(0x2039, 0x0A))[0]
+        if pos_limits_control == 3:
+            pos_control_str = "ENABLED"
+        elif pos_limits_control == 0:
+            pos_control_str = "DISABLED"
+        else:
+            pos_control_str = f"UNKNOWN (0x{pos_limits_control:04X})"
+        print(f"  Position Limits Control:     {pos_control_str}")
+    except Exception as exc:
+        print(f"  Position Limits Control:     read failed ({exc})")
+    
+    # Max Measured Position Limit (0x2039.03h) — in counts, no conversion
+    try:
+        max_pos = struct.unpack("<i", slave.sdo_read(0x2039, 0x03))[0]
+        print(f"    Max Measured Position:       {max_pos:+12d} counts")
+    except Exception as exc:
+        print(f"    Max Measured Position:       read failed ({exc})")
+    
+    # Min Measured Position Limit (0x2039.04h) — in counts, no conversion
+    try:
+        min_pos = struct.unpack("<i", slave.sdo_read(0x2039, 0x04))[0]
+        print(f"    Min Measured Position:       {min_pos:+12d} counts")
+    except Exception as exc:
+        print(f"    Min Measured Position:       read failed ({exc})")
+    
+    print("---------------------------------------------------")
+    print()
+
+
+# Event Action mapping for 0x2065:21 (Event Action: Communication Error)
+EVENT_ACTIONS = {
+    0x00: "No action",
+    0x01: "Disable power bridge",
+    0x02: "Disable positive direction",
+    0x03: "Disable negative direction",
+    0x04: "Dynamic Brake",
+    0x05: "Positive stop",
+    0x06: "Negative stop",
+    0x07: "Stop",
+    0x08: "Apply Brake then disable bridge",
+    0x09: "Apply Brake then dynamic brake",
+    0x0A: "Apply Brake and Disable bridge",
+    0x0B: "Apply Brake and Dynamic Brake"
+}
+
+
+def _decode_modes_of_operation(mode):
+    """Decode the Modes Of Operation Display value (0x6061:00)."""
+    modes = {
+        0: "No mode / Error",
+        1: "Profile Position",
+        3: "Profile Velocity",
+        4: "Profile Torque",
+        6: "Homing",
+        7: "Interpolated Position",
+        8: "Cyclic Synchronous Position",
+        9: "Cyclic Synchronous Velocity",
+        10: "Cyclic Synchronous Torque (CST)",
+        -1: "Not assigned",
+    }
+    return modes.get(mode, f"Unknown (0x{mode:02X})")
+
+
+def read_critical_diagnostics(slave):
+    """Read critical diagnostic SDO objects to identify fault root cause.
+    
+    Returns a dictionary with the following keys:
+    - 'modes_of_operation': Current mode (0x6061:00)
+    - 'feedback_error_counter': Cumulative feedback sensor errors (0x2028:0F)
+    - 'communication_error_counter': Cumulative communication errors (0x2028:2F)
+    - 'communication_error_event_action': Event action on comm error (0x2065:21)
+    - 'raw': Raw dict with uninterpreted values
+    
+    Each field is wrapped in try/except so one read failure doesn't block others.
+    """
+    diag = {
+        'modes_of_operation': None,
+        'feedback_error_counter': None,
+        'communication_error_counter': None,
+        'communication_error_event_action': None,
+        'raw': {}
+    }
+    
+    # 0x6061:00 — Modes Of Operation Display
+    try:
+        mode_raw = struct.unpack("<b", slave.sdo_read(0x6061, 0x00))[0]
+        diag['modes_of_operation'] = _decode_modes_of_operation(mode_raw)
+        diag['raw']['modes_of_operation'] = mode_raw
+    except Exception as exc:
+        diag['modes_of_operation'] = f"read failed: {exc}"
+        diag['raw']['modes_of_operation'] = None
+    
+    # 0x2028:0F — Feedback Sensor Error Counter
+    try:
+        fb_counter = struct.unpack("<H", slave.sdo_read(0x2028, 0x0F))[0]
+        diag['feedback_error_counter'] = fb_counter
+        diag['raw']['feedback_error_counter'] = fb_counter
+    except Exception as exc:
+        diag['feedback_error_counter'] = f"read failed: {exc}"
+        diag['raw']['feedback_error_counter'] = None
+    
+    # 0x2028:2F — Communication Error Counter
+    try:
+        comm_counter = struct.unpack("<H", slave.sdo_read(0x2028, 0x2F))[0]
+        diag['communication_error_counter'] = comm_counter
+        diag['raw']['communication_error_counter'] = comm_counter
+    except Exception as exc:
+        diag['communication_error_counter'] = f"read failed: {exc}"
+        diag['raw']['communication_error_counter'] = None
+    
+    # 0x2065:21 — Event Action: Communication Error
+    try:
+        event_action_raw = struct.unpack("<H", slave.sdo_read(0x2065, 0x21))[0]
+        action_bits = []
+        for bit_val, bit_name in EVENT_ACTIONS.items():
+            if event_action_raw & bit_val:
+                action_bits.append(bit_name)
+        event_action_str = " | ".join(action_bits) if action_bits else "No action (0x0000)"
+        diag['communication_error_event_action'] = event_action_str
+        diag['raw']['communication_error_event_action'] = event_action_raw
+    except Exception as exc:
+        diag['communication_error_event_action'] = f"read failed: {exc}"
+        diag['raw']['communication_error_event_action'] = None
+    
+    return diag
+
+
+def _print_critical_diagnostics(label, diag):
+    """Print critical diagnostics in a formatted block."""
+    print(f"\n--- Critical Diagnostics ({label}) ---")
+    print(f"  Modes Of Operation Display (0x6061:00): {diag['modes_of_operation']}")
+    print(f"  Feedback Sensor Error Counter (0x2028:0F): {diag['feedback_error_counter']}")
+    print(f"  Communication Error Counter (0x2028:2F): {diag['communication_error_counter']}")
+    raw_event_action = diag['raw'].get('communication_error_event_action')
+    if raw_event_action is not None:
+        print(f"  Event Action: Comm Error (0x2065:21): 0x{raw_event_action:04X}")
+    print(f"    → {diag['communication_error_event_action']}")
+    print("-------------------------------------------\n")
+
+
+def _print_diagnostic_deltas(baseline, fault):
+    """Compare and print counter deltas between baseline and fault diagnostics."""
+    print("\n--- Diagnostic Counter Changes (baseline → fault) ---")
+    
+    fb_baseline = baseline['raw'].get('feedback_error_counter')
+    fb_fault = fault['raw'].get('feedback_error_counter')
+    if fb_baseline is not None and fb_fault is not None and isinstance(fb_baseline, int) and isinstance(fb_fault, int):
+        delta_fb = fb_fault - fb_baseline
+        print(f"  Feedback Sensor Errors:  {fb_baseline} → {fb_fault}  (Δ = {delta_fb:+d})")
+    else:
+        print(f"  Feedback Sensor Errors:  (unavailable for delta calculation)")
+    
+    comm_baseline = baseline['raw'].get('communication_error_counter')
+    comm_fault = fault['raw'].get('communication_error_counter')
+    if comm_baseline is not None and comm_fault is not None and isinstance(comm_baseline, int) and isinstance(comm_fault, int):
+        delta_comm = comm_fault - comm_baseline
+        print(f"  Communication Errors:    {comm_baseline} → {comm_fault}  (Δ = {delta_comm:+d})")
+        if delta_comm > 0:
+            print(f"    ⚠ Communication error(s) detected — likely EtherCAT watchdog timeout or frame loss")
+    else:
+        print(f"  Communication Errors:    (unavailable for delta calculation)")
+    
+    print("--------------------------------------------------\n")
+
+
 def _exchange_and_read_statusword(master, slave):
     master.send_processdata()
-    wkc = master.receive_processdata(2000)
+    wkc = master.receive_processdata(15000)  # 15ms timeout for 10ms cycle + margin
     status_word = struct.unpack_from("<H", slave.input, 0)[0]
     return status_word, wkc
 
@@ -391,9 +627,10 @@ def acquisition_loop(master, slave, k_p_amps, buffer, buffer_lock, stop_event, c
     log_byte_buffer = bytearray()
     drive_enabled = False
     sine_start_time = None   # perf_counter() timestamp when the drive was enabled
+    baseline_diagnostics = None  # Captured immediately after enable for comparison on fault
 
     def handle_command(command):
-        nonlocal log_state, log_file, log_path, log_byte_buffer, drive_enabled, sine_start_time
+        nonlocal log_state, log_file, log_path, log_byte_buffer, drive_enabled, sine_start_time, baseline_diagnostics
 
         action = command[0]
 
@@ -402,6 +639,9 @@ def acquisition_loop(master, slave, k_p_amps, buffer, buffer_lock, stop_event, c
                 status_word = run_enable_sequence(master, slave)
                 drive_enabled = True
                 sine_start_time = time.perf_counter()
+                # Capture baseline diagnostics immediately after successful enable
+                baseline_diagnostics = read_critical_diagnostics(slave)
+                _print_critical_diagnostics("after enable (baseline)", baseline_diagnostics)
                 status_queue.put(("drive_enabled", status_word))
             except RuntimeError as exc:
                 print(f"Drive enable failed: {exc}")
@@ -412,6 +652,7 @@ def acquisition_loop(master, slave, k_p_amps, buffer, buffer_lock, stop_event, c
             status_word = disable_drive(master, slave)
             drive_enabled = False
             sine_start_time = None
+            baseline_diagnostics = None  # Clear baseline on disable
             status_queue.put(("drive_disabled", status_word))
             return
 
@@ -464,6 +705,9 @@ def acquisition_loop(master, slave, k_p_amps, buffer, buffer_lock, stop_event, c
     last_print = start_time
     last_loop_time = start_time
 
+    max_cycle_ms = 0.0
+    max_cycle_time = start_time  # wall-clock time when max cycle was measured
+
     sample_count = 0
 
     while not stop_event.is_set():
@@ -484,6 +728,11 @@ def acquisition_loop(master, slave, k_p_amps, buffer, buffer_lock, stop_event, c
         now = time.perf_counter()
         actual_cycle_ms = (now - last_loop_time) * 1000.0
         last_loop_time = now
+        
+        # Track maximum cycle time observed
+        if actual_cycle_ms > max_cycle_ms:
+            max_cycle_ms = actual_cycle_ms
+            max_cycle_time = now
 
         #
         # Drive the current-loop sine wave reference while enabled
@@ -497,7 +746,7 @@ def acquisition_loop(master, slave, k_p_amps, buffer, buffer_lock, stop_event, c
         # PDO exchange
         #
         master.send_processdata()
-        wkc = master.receive_processdata(2000)
+        wkc = master.receive_processdata(15000)  # 15ms timeout for 10ms cycle + margin
 
         pdo = slave.input
 
@@ -517,16 +766,29 @@ def acquisition_loop(master, slave, k_p_amps, buffer, buffer_lock, stop_event, c
         elapsed = now - start_time
         
         #
-        # Monitor for secondary faults during operation (every 10 samples = ~10ms at 1kHz)
+        # Monitor for secondary faults during operation (every sample at 100Hz = every 10ms)
+        # Read both extended and critical diagnostics to identify fault root cause
         #
-        if drive_enabled and (sample_count % 10 == 0):
-            fault_info = _check_and_log_fault_during_operation(master, slave, log_prefix=f"t={elapsed:.3f}s")
-            if fault_info is not None:
-                drive_enabled = False
-                status_queue.put(("drive_fault_secondary", fault_info))
+        if drive_enabled and (sample_count % 1 == 0):
+            try:
+                status_word = struct.unpack_from("<H", slave.input, 0)[0]
+                if status_word & CIA402_SW_FAULT_BIT:
+                    # Fault detected — read extended diagnostics and compare with baseline
+                    extended_fault_info = _read_extended_fault_info(slave)
+                    critical_fault_diag = read_critical_diagnostics(slave)
+                    _print_critical_diagnostics("at fault detection", critical_fault_diag)
+                    if baseline_diagnostics is not None:
+                        _print_diagnostic_deltas(baseline_diagnostics, critical_fault_diag)
+                    max_cycle_elapsed = (max_cycle_time - start_time)
+                    print(f"[FAULT DETECTED] t={elapsed:.3f}s SW=0x{status_word:04X} | {extended_fault_info}")
+                    print(f"  Max cycle time: {max_cycle_ms:.3f}ms at t={max_cycle_elapsed:.3f}s")
+                    drive_enabled = False
+                    status_queue.put(("drive_fault_secondary", extended_fault_info))
+            except Exception as exc:
+                print(f"[ERROR checking fault] {exc}")
 
         with buffer_lock:
-            buffer.append((elapsed, position, current_amps, analog_input_2_raw))
+            buffer.append((elapsed, position, current_amps, analog_input_2_raw, velocity))
 
         #
         # Binary log write (only while logging is running)
@@ -752,7 +1014,7 @@ def simulation_acquisition_loop(buffer, buffer_lock, stop_event, command_queue, 
         analog_input_2_raw = int(position * 0.1 + SIM_NOISE_AMP * 100 * (2.0 * np.random.random() - 1.0))
 
         with buffer_lock:
-            buffer.append((elapsed, position, current_amps, analog_input_2_raw))
+            buffer.append((elapsed, position, current_amps, analog_input_2_raw, velocity))
 
         if log_state == "RUNNING":
             log_byte_buffer += RECORD_STRUCT.pack(
@@ -775,11 +1037,11 @@ def simulation_acquisition_loop(buffer, buffer_lock, stop_event, command_queue, 
 
 
 class ScopeGUI:
-    """Tkinter window with a 2x2 graph grid: scrolling position/current scope
-    traces on the left sharing an adjustable time-axis window length, and
-    their live FFTs on the right sharing an adjustable max-frequency axis,
-    plus binary (.dat) logging controls (start/pause/resume/stop, filename
-    entry, convert to CSV).
+    """Tkinter window with a 3x2 graph grid: scrolling position/current/velocity
+    traces on the left (3 rows) sharing an adjustable time-axis window length,
+    and their live FFTs (position and current) on the right (2 rows) sharing an
+    adjustable max-frequency axis, plus binary (.dat) logging controls
+    (start/pause/resume/stop, filename entry, convert to CSV).
     """
 
     def __init__(self, root, buffer, buffer_lock, stop_event, command_queue, status_queue, sim_warning=None):
@@ -810,18 +1072,23 @@ class ScopeGUI:
         main_frame.pack(fill=tk.BOTH, expand=True)
 
         self.figure = Figure(figsize=(11, 6), dpi=100)
-        self.ax_position = self.figure.add_subplot(2, 2, 1)
-        self.ax_current = self.figure.add_subplot(2, 2, 3, sharex=self.ax_position)
-        self.ax_fft_position = self.figure.add_subplot(2, 2, 2)
-        self.ax_fft_current = self.figure.add_subplot(2, 2, 4, sharex=self.ax_fft_position)
+        self.ax_position = self.figure.add_subplot(3, 2, 1)
+        self.ax_current = self.figure.add_subplot(3, 2, 3, sharex=self.ax_position)
+        self.ax_velocity = self.figure.add_subplot(3, 2, 5, sharex=self.ax_position)
+        self.ax_fft_position = self.figure.add_subplot(3, 2, 2)
+        self.ax_fft_current = self.figure.add_subplot(3, 2, 4, sharex=self.ax_fft_position)
 
         self.ax_position.set_ylabel("Position (counts)")
         self.ax_position.set_title("Position")
         self.ax_position.tick_params(labelbottom=False)
 
         self.ax_current.set_ylabel("Current (A)")
-        self.ax_current.set_xlabel("Time (s)")
         self.ax_current.set_title("Current")
+        self.ax_current.tick_params(labelbottom=False)
+
+        self.ax_velocity.set_ylabel("Velocity (counts/s)")
+        self.ax_velocity.set_xlabel("Time (s)")
+        self.ax_velocity.set_title("Velocity")
 
         self.ax_fft_position.set_ylabel("Magnitude")
         self.ax_fft_position.set_title("Position FFT")
@@ -833,6 +1100,7 @@ class ScopeGUI:
 
         self.line_position, = self.ax_position.plot([], [], color="tab:blue")
         self.line_current, = self.ax_current.plot([], [], color="tab:orange")
+        self.line_velocity, = self.ax_velocity.plot([], [], color="tab:purple")
         self.line_fft_position, = self.ax_fft_position.plot([], [], color="tab:green")
         self.line_fft_current, = self.ax_fft_current.plot([], [], color="tab:red")
 
@@ -843,7 +1111,7 @@ class ScopeGUI:
         # grid) is only re-rendered every FULL_REDRAW_EVERY frames; all other
         # frames restore the cached background and blit only the lines —
         # typically 10-20× faster than a full draw.
-        for _line in (self.line_position, self.line_current,
+        for _line in (self.line_position, self.line_current, self.line_velocity,
                       self.line_fft_position, self.line_fft_current):
             _line.set_animated(True)
 
@@ -1088,6 +1356,7 @@ class ScopeGUI:
             positions          = [s[1] for s in visible]
             currents           = [s[2] for s in visible]
             analog_inputs_2    = [s[3] for s in visible]
+            velocities         = [s[4] for s in visible]
 
             # Express x as "seconds before now" so xlim stays fixed at
             # [-window, 0] — a stable coordinate space that allows blitting
@@ -1096,6 +1365,7 @@ class ScopeGUI:
 
             self.line_position.set_data(rel_times, positions)
             self.line_current.set_data(rel_times, currents)
+            self.line_velocity.set_data(rel_times, velocities)
 
             # Update live analog input 2 display (latest value in the status label)
             if analog_inputs_2:
@@ -1119,6 +1389,8 @@ class ScopeGUI:
                 self.ax_position.autoscale_view(scalex=False, scaley=True)
                 self.ax_current.relim()
                 self.ax_current.autoscale_view(scalex=False, scaley=True)
+                self.ax_velocity.relim()
+                self.ax_velocity.autoscale_view(scalex=False, scaley=True)
                 self._update_fft_plots(times, positions, currents)
                 self.canvas.draw()
                 self._blit_bg = self.canvas.copy_from_bbox(self.figure.bbox)
@@ -1127,6 +1399,7 @@ class ScopeGUI:
                 self.canvas.restore_region(self._blit_bg)
                 self.ax_position.draw_artist(self.line_position)
                 self.ax_current.draw_artist(self.line_current)
+                self.ax_velocity.draw_artist(self.line_velocity)
                 self.ax_fft_position.draw_artist(self.line_fft_position)
                 self.ax_fft_current.draw_artist(self.line_fft_current)
                 self.canvas.blit(self.figure.bbox)
@@ -1134,6 +1407,10 @@ class ScopeGUI:
         self.root.after(GUI_REFRESH_MS, self.refresh)
 
     def _update_fft_plots(self, times, positions, currents):
+        if not ENABLE_FFT:
+            # FFT disabled to reduce GIL contention during critical operation
+            return
+        
         if len(times) < 2:
             return
 
