@@ -34,6 +34,7 @@ WINDOW_MIN_S = 0.1        # shared time-axis slider range (seconds)
 WINDOW_MAX_S = 5.0
 WINDOW_DEFAULT_S = 2.0
 WINDOW_STEP_S = 0.1
+FAULT_WINDOW_S = 2.0      # Track cycle times within this window for recent fault diagnostics
 BUFFER_MAXLEN = 2000      # ~20s of samples at 100Hz PDO rate (was 20000 at 1kHz)
 
 FFT_FREQ_MIN = 50         # FFT max-frequency slider range (Hz)
@@ -74,7 +75,8 @@ SINE_FREQ_HZ = 2.0      # current-loop reference applied once the drive is enabl
 SINE_AMPLITUDE_A = 1.0  # reduced from 2.0A to avoid exceeding velocity/acceleration protection limits at lower cycle rate
 
 # GUI PERFORMANCE TUNING
-ENABLE_FFT = False  # Set to False to reduce GIL contention during testing; True for full scope features
+ENABLE_FFT = True  # Set to False to reduce GIL contention during testing; True for full scope features
+MINIMAL_GUI_ON_DRIVE = True  # Disable all plotting when drive is enabled; re-enable on disable for analysis
 
 # --------- PDO MAPPING CONFIGURATION ---------
 # Explicit RxPDO (0x1600) and TxPDO (0x1A00) mapping definitions.
@@ -153,6 +155,15 @@ def connect_and_configure(adapter_name):
     # Print protection limits before enabling
     #
     _print_protection_limits(slave)
+
+    #
+    # VOICE COIL MOTOR CONFIGURATION
+    # The motor is a linear voice coil with NO velocity/acceleration feedback device.
+    # The drive is configured for Cyclic Synchronous Torque (CST) mode with current-loop-only control.
+    # Disable all feedback sensor error checking to prevent false Feedback Sensor Error on startup.
+    # The PAI-2 laser sensor will not be used by the drive for control (remains mapped in TxPDO for diagnostics only).
+    #
+    _configure_feedback_disabled(slave)
 
     #
     # Configure PDO mappings explicitly to ensure Analog Input 2 is included.
@@ -390,9 +401,169 @@ def _print_protection_limits(slave):
     except Exception as exc:
         print(f"    Min Measured Position:       read failed ({exc})")
     
+    # Feedback Sensor Configuration
+    print()
+    print("--- Feedback Sensor Configuration ---")
+    try:
+        encoder_type = struct.unpack("<H", slave.sdo_read(0x2032, 0x07))[0]
+        encoder_str = "Not Assigned (disabled)" if encoder_type == 0 else f"Encoder Type: 0x{encoder_type:04X}"
+        print(f"  Serial Encoder Type (0x2032.07):  {encoder_str}")
+    except Exception as exc:
+        print(f"  Serial Encoder Type (0x2032.07):  read failed ({exc})")
+    
+    try:
+        error_window = struct.unpack("<H", slave.sdo_read(0x2032, 0x0D))[0]
+        # Convert from physical units (SF1 scaling): raw value / 0x4000 = physical value (0 to 1)
+        phys_window = error_window / 0x4000 if error_window > 0 else 0.0
+        print(f"  Sin/Cos Error Window (0x2032.0D): 0x{error_window:04X} (phys ≈ {phys_window:.3f})")
+    except Exception as exc:
+        print(f"  Sin/Cos Error Window (0x2032.0D): read failed ({exc})")
+    
+    try:
+        error_action = struct.unpack("<H", slave.sdo_read(0x2065, 0x06))[0]
+        action_str = "No Action (disabled)" if error_action == 0 else f"Action: 0x{error_action:04X}"
+        print(f"  Feedback Sensor Error Action (0x2065.06): {action_str}")
+    except Exception as exc:
+        print(f"  Feedback Sensor Error Action (0x2065.06): read failed ({exc})")
+    
     print("---------------------------------------------------")
     print()
 
+
+def _configure_feedback_disabled(slave):
+    """Disable ALL encoder feedback monitoring for current-loop-only voice coil operation.
+    
+    Attempts to disable encoder-related SDO objects. Some may be read-only or protected;
+    failures are logged but do not stop operation if at least the critical flags are disabled.
+    """
+    failed_writes = []
+    successful_writes = []
+    
+    # Primary writes: must succeed or we'll likely fault on enable
+    critical_writes = [
+        (0x2032, 0x01, "<H", 0x0000, "Encoder Present"),
+        (0x2032, 0x06, "<H", 0x0000, "Encoder Enable"),
+        (0x2032, 0x07, "<H", 0x0000, "Serial Encoder Type"),
+        (0x2032, 0x08, "<H", 0x0000, "Encoder Monitoring Mode"),
+        (0x2032, 0x09, "<H", 0x0000, "Encoder Health Check"),
+        (0x2032, 0x0C, "<H", 0x0000, "Back-EMF Feedback"),
+        (0x2032, 0x0D, "<H", 0x4000, "Sin/Cos Error Window (max tolerance)"),
+        (0x2065, 0x06, "<H", 0x0000, "Feedback Sensor Error Action"),
+        (0x2036, 0x01, "<H", 0x0000, "Commutation Type"),
+        (0x2036, 0x02, "<I", 0x00000000, "Commutation Polarity"),
+        (0x2032, 0x05, "<H", 0x0000, "Encoder Offset"),
+    ]
+    
+    # Optional writes: some AMC firmware versions protect these (read-only)
+    # Skip if they fail — they're less critical for CST operation
+    optional_writes = [
+        (0x2036, 0x03, "<H", 0x0000, "Commutation Timing (read-only on some firmware)"),
+        (0x2032, 0x03, "<H", 0x0000, "Sin/Cos Encoder Phase (read-only on some firmware)"),
+        (0x2032, 0x04, "<H", 0x0000, "Commutation Encoder Config (read-only on some firmware)"),
+    ]
+    
+    for obj, sub, fmt, value, desc in critical_writes:
+        try:
+            data = struct.pack(fmt, value)
+            slave.sdo_write(obj, sub, data)
+            successful_writes.append(f"  ✓ 0x{obj:04X}.{sub:02X} ({desc}) = 0x{value:X}")
+        except Exception as exc:
+            failed_writes.append(f"  ✗ 0x{obj:04X}.{sub:02X} ({desc}): {exc}")
+    
+    optional_failed = []
+    for obj, sub, fmt, value, desc in optional_writes:
+        try:
+            data = struct.pack(fmt, value)
+            slave.sdo_write(obj, sub, data)
+            successful_writes.append(f"  ✓ 0x{obj:04X}.{sub:02X} ({desc}) = 0x{value:X}")
+        except Exception as exc:
+            optional_failed.append(f"  ⚠ 0x{obj:04X}.{sub:02X} ({desc}): SKIPPED (read-only)")
+    
+    # Print summary
+    print("\n--- Feedback/Commutation Configuration ---")
+    if successful_writes:
+        print("Successful writes:")
+        for msg in successful_writes:
+            print(msg)
+    
+    if failed_writes:
+        print("CRITICAL FAILED writes (blocking):")
+        for msg in failed_writes:
+            print(msg)
+        raise RuntimeError(f"Critical encoder configuration writes failed—cannot proceed")
+    
+    if optional_failed:
+        print("Optional writes skipped (read-only/protected on this firmware):")
+        for msg in optional_failed:
+            print(msg)
+    
+    print("--------------------------------------\n")
+
+def _scan_motor_configuration(slave):
+    """Scan 0x2032h, 0x2034h, 0x2036h objects for motor/encoder monitoring."""
+    print("\n[MOTOR CONFIGURATION SCAN]")
+    
+    for obj in [0x2032, 0x2034, 0x2036]:
+        try:
+            obj_name = {0x2032: "Encoder Parameters", 0x2034: "Motor Parameters", 0x2036: "Commutation"}[obj]
+            print(f"\n  0x{obj:04X} ({obj_name}):")
+            
+            for sub in range(0x01, 0x30):
+                try:
+                    data = slave.sdo_read(obj, sub)
+                    if len(data) == 2:
+                        value = struct.unpack("<H", data)[0]
+                    elif len(data) == 4:
+                        value = struct.unpack("<I", data)[0]
+                    else:
+                        continue
+                    
+                    if value != 0:
+                        print(f"    {sub:02X}: 0x{value:08X}")
+                except Exception:
+                    pass
+        except Exception as exc:
+            print(f"  Scan error: {exc}")
+    print()
+
+def _verify_feedback_config_persistence(slave):
+    """Verify that all encoder/feedback configuration SDO writes persisted after enable.
+    Only checks parameters that are actually writable on the drive."""
+    try:
+        print("\n[CONFIG VERIFICATION - IMMEDIATELY AFTER DISABLE]")
+        
+        checks = [
+            (0x2032, 0x01, "<H", 0x0000, "Encoder Present"),
+            (0x2032, 0x06, "<H", 0x0000, "Encoder Enable"),
+            (0x2032, 0x07, "<H", 0x0000, "Encoder Type"),
+            (0x2032, 0x08, "<H", 0x0000, "Encoder Monitoring"),
+            (0x2032, 0x09, "<H", 0x0000, "Encoder Health"),
+            (0x2032, 0x0C, "<H", 0x0000, "Back-EMF Feedback"),
+            (0x2032, 0x0D, "<H", 0x4000, "Error Window"),
+            (0x2065, 0x06, "<H", 0x0000, "Feedback Error Action"),
+            (0x2036, 0x01, "<H", 0x0000, "Commutation Type"),
+            (0x2036, 0x02, "<I", 0x00000000, "Commutation Polarity"),
+            (0x2032, 0x05, "<H", 0x0000, "Encoder Offset"),
+        ]
+        
+        for obj, sub, fmt, expected, desc in checks:
+            try:
+                raw = slave.sdo_read(obj, sub)
+                if fmt == "<I":
+                    actual = struct.unpack(fmt, raw)[0]
+                else:
+                    actual = struct.unpack(fmt, raw)[0]
+                status = "✓" if actual == expected else "✗"
+                print(f"  {status} 0x{obj:04X}.{sub:02X} ({desc}): 0x{actual:X} (expect 0x{expected:X})")
+                if actual != expected:
+                    raise RuntimeError(f"Value mismatch: expected 0x{expected:X}, got 0x{actual:X}")
+            except Exception as exc:
+                print(f"  ✗ 0x{obj:04X}.{sub:02X} ({desc}): read failed ({exc})")
+                raise
+
+        print("  ✓ All writable encoder/feedback parameters verified\n")
+    except Exception as exc:
+        raise RuntimeError(f"Configuration persistence verification failed: {exc}")
 
 # Event Action mapping for 0x2065:21 (Event Action: Communication Error)
 EVENT_ACTIONS = {
@@ -628,9 +799,10 @@ def acquisition_loop(master, slave, k_p_amps, buffer, buffer_lock, stop_event, c
     drive_enabled = False
     sine_start_time = None   # perf_counter() timestamp when the drive was enabled
     baseline_diagnostics = None  # Captured immediately after enable for comparison on fault
+    fault_detected_info = None  # Stores (elapsed_time, status_word, max_cycle_ms, max_cycle_elapsed) when fault detected; read on disable
 
     def handle_command(command):
-        nonlocal log_state, log_file, log_path, log_byte_buffer, drive_enabled, sine_start_time, baseline_diagnostics
+        nonlocal log_state, log_file, log_path, log_byte_buffer, drive_enabled, sine_start_time, baseline_diagnostics, fault_detected_info
 
         action = command[0]
 
@@ -652,7 +824,36 @@ def acquisition_loop(master, slave, k_p_amps, buffer, buffer_lock, stop_event, c
             status_word = disable_drive(master, slave)
             drive_enabled = False
             sine_start_time = None
-            baseline_diagnostics = None  # Clear baseline on disable
+            
+            # Verify feedback configuration persisted through operation (deferred SDO read — safe after disable)
+            try:
+                _verify_feedback_config_persistence(slave)
+            except Exception as exc:
+                print(f"[CONFIG VERIFICATION ERROR] {exc}")
+
+            try:
+                _scan_motor_configuration(slave)
+            except Exception as exc:
+                print(f"[MOTOR CONFIGURATION SCAN ERROR] {exc}")
+
+            # If a fault was detected, read diagnostics now (deferred from operation)
+            if fault_detected_info is not None:
+                elapsed_time, fault_sw, fault_cycle_ms, fault_cycle_elapsed = fault_detected_info
+                try:
+                    extended_fault_info = _read_extended_fault_info(slave)
+                    critical_fault_diag = read_critical_diagnostics(slave)
+                    _print_critical_diagnostics("post-operation (fault diagnostics)", critical_fault_diag)
+                    if baseline_diagnostics is not None:
+                        _print_diagnostic_deltas(baseline_diagnostics, critical_fault_diag)
+                    print(f"[FAULT INFO] t={elapsed_time:.3f}s SW=0x{fault_sw:04X} | {extended_fault_info}")
+                    print(f"  Max cycle time: {fault_cycle_ms:.3f}ms at t={fault_cycle_elapsed:.3f}s")
+                    status_queue.put(("drive_fault_secondary", extended_fault_info))
+                except Exception as exc:
+                    print(f"[ERROR reading fault diagnostics] {exc}")
+                fault_detected_info = None
+            else:
+                baseline_diagnostics = None  # Clear baseline on normal disable
+            
             status_queue.put(("drive_disabled", status_word))
             return
 
@@ -705,8 +906,9 @@ def acquisition_loop(master, slave, k_p_amps, buffer, buffer_lock, stop_event, c
     last_print = start_time
     last_loop_time = start_time
 
-    max_cycle_ms = 0.0
-    max_cycle_time = start_time  # wall-clock time when max cycle was measured
+    # Sliding window deque: stores (elapsed_seconds, actual_cycle_ms) tuples
+    # for the last FAULT_WINDOW_S seconds to capture recent cycle performance
+    cycle_time_window = deque(maxlen=int(CYCLE_TIME_S * 100) + 1)  # max ~200 entries for 2s @ 100Hz
 
     sample_count = 0
 
@@ -728,11 +930,10 @@ def acquisition_loop(master, slave, k_p_amps, buffer, buffer_lock, stop_event, c
         now = time.perf_counter()
         actual_cycle_ms = (now - last_loop_time) * 1000.0
         last_loop_time = now
+        elapsed = now - start_time
         
-        # Track maximum cycle time observed
-        if actual_cycle_ms > max_cycle_ms:
-            max_cycle_ms = actual_cycle_ms
-            max_cycle_time = now
+        # Append cycle to sliding window (old entries auto-drop when maxlen reached)
+        cycle_time_window.append((elapsed, actual_cycle_ms))
 
         #
         # Drive the current-loop sine wave reference while enabled
@@ -762,28 +963,32 @@ def acquisition_loop(master, slave, k_p_amps, buffer, buffer_lock, stop_event, c
         analog_input_2_raw = struct.unpack_from("<h", pdo, ANALOG_INPUT_2_TPDO_OFFSET)[0]
 
         current_amps = raw_current * k_p_amps / 8192.0
-
-        elapsed = now - start_time
         
         #
-        # Monitor for secondary faults during operation (every sample at 100Hz = every 10ms)
-        # Read both extended and critical diagnostics to identify fault root cause
+        # Monitor for secondary faults during operation — PDO-only check, no blocking SDO reads
+        # Diagnostics are read later in disable handler to avoid blocking the acquisition loop
         #
         if drive_enabled and (sample_count % 1 == 0):
             try:
-                status_word = struct.unpack_from("<H", slave.input, 0)[0]
                 if status_word & CIA402_SW_FAULT_BIT:
-                    # Fault detected — read extended diagnostics and compare with baseline
-                    extended_fault_info = _read_extended_fault_info(slave)
-                    critical_fault_diag = read_critical_diagnostics(slave)
-                    _print_critical_diagnostics("at fault detection", critical_fault_diag)
-                    if baseline_diagnostics is not None:
-                        _print_diagnostic_deltas(baseline_diagnostics, critical_fault_diag)
-                    max_cycle_elapsed = (max_cycle_time - start_time)
-                    print(f"[FAULT DETECTED] t={elapsed:.3f}s SW=0x{status_word:04X} | {extended_fault_info}")
-                    print(f"  Max cycle time: {max_cycle_ms:.3f}ms at t={max_cycle_elapsed:.3f}s")
+                    # Find worst cycle within the last FAULT_WINDOW_S seconds
+                    cutoff_time = elapsed - FAULT_WINDOW_S
+                    recent_cycles = [cyc for et, cyc in cycle_time_window if et >= cutoff_time]
+                    recent_max_ms = max(recent_cycles) if recent_cycles else actual_cycle_ms
+                    
+                    # Find elapsed time when that worst cycle occurred
+                    recent_max_time = None
+                    for et, cyc in cycle_time_window:
+                        if cyc == recent_max_ms and et >= cutoff_time:
+                            recent_max_time = et
+                            break
+                    
+                    print(f"[FAULT DETECTED] t={elapsed:.3f}s SW=0x{status_word:04X}")
+                    print(f"  Max cycle (last {FAULT_WINDOW_S}s): {recent_max_ms:.3f}ms at t={recent_max_time:.3f}s")
+                    
+                    # Store fault info for diagnostics read in disable handler
+                    fault_detected_info = (elapsed, status_word, recent_max_ms, recent_max_time)
                     drive_enabled = False
-                    status_queue.put(("drive_fault_secondary", extended_fault_info))
             except Exception as exc:
                 print(f"[ERROR checking fault] {exc}")
 
@@ -1054,6 +1259,8 @@ class ScopeGUI:
 
         self.log_state = "IDLE"
         self.last_closed_log_path = None
+        self.plotting_enabled = True  # Plots visible by default; disabled when drive is enabled
+        self.drive_active = False     # Track if drive is currently enabled
 
         self.window_seconds = tk.DoubleVar(value=WINDOW_DEFAULT_S)
         self.fft_max_freq = tk.IntVar(value=FFT_FREQ_DEFAULT)
@@ -1231,6 +1438,12 @@ class ScopeGUI:
         self.root.after(GUI_REFRESH_MS, self.refresh)
 
     def on_enable_click(self):
+        if MINIMAL_GUI_ON_DRIVE:
+            self.figure.set_visible(False)        # Hide matplotlib figure to eliminate GIL contention
+            self.slider.config(state=tk.DISABLED)          # Disable time window slider
+            self.fft_freq_slider.config(state=tk.DISABLED)  # Disable FFT frequency slider
+            self.plotting_enabled = False
+            self.drive_active = True
         self.enable_button.config(state=tk.DISABLED)
         self.drive_status_var.set("Drive: enabling...")
         self.command_queue.put(("enable",))
@@ -1286,6 +1499,13 @@ class ScopeGUI:
             elif event == "drive_disabled":
                 self.enable_button.config(state=tk.NORMAL)
                 self.drive_status_var.set(f"Drive: disabled (SW=0x{payload:04X})")
+                if MINIMAL_GUI_ON_DRIVE:
+                    self.figure.set_visible(True)        # Re-enable plots for analysis
+                    self.slider.config(state=tk.NORMAL)          # Re-enable sliders
+                    self.fft_freq_slider.config(state=tk.NORMAL)
+                    self.plotting_enabled = True
+                    self.drive_active = False
+                    self._needs_full_draw = True  # Force full redraw with current data
 
             elif event == "started":
                 self.log_state = "RUNNING"
@@ -1345,7 +1565,8 @@ class ScopeGUI:
         with self.buffer_lock:
             snapshot = list(self.buffer)
 
-        if snapshot:
+        # Only perform plotting if enabled (skipped during drive operation to reduce GIL contention)
+        if self.plotting_enabled and snapshot:
             window = self.window_seconds.get()
             now = snapshot[-1][0]
             cutoff = now - window
@@ -1407,10 +1628,6 @@ class ScopeGUI:
         self.root.after(GUI_REFRESH_MS, self.refresh)
 
     def _update_fft_plots(self, times, positions, currents):
-        if not ENABLE_FFT:
-            # FFT disabled to reduce GIL contention during critical operation
-            return
-        
         if len(times) < 2:
             return
 
